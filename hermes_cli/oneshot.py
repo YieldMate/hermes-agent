@@ -32,6 +32,7 @@ _USAGE_KEYS = (
     "estimated_cost_usd", "cost_status", "cost_source", "input_tokens", "output_tokens",
     "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "total_tokens", "api_calls",
     "model", "provider", "session_id", "completed", "partial", "interrupted", "turn_exit_reason",
+    "usage_by_model",
 )
 
 # Counters summed per auxiliary task (vision, compression, title_generation, ...) into the
@@ -252,6 +253,10 @@ def run_oneshot(
     the CLI layer: latest/title/--continue resolution) whose transcript is loaded and continued
     by this turn. Returns the exit code; the caller owns process termination.
     """
+    # Paperclip in-process chat cannot pass ``--usage-file``; read HERMES_USAGE_FILE instead.
+    if not usage_file:
+        usage_file = (os.getenv("HERMES_USAGE_FILE") or "").strip() or None
+
     # Silence every stdlib logger: AIAgent, tools and provider adapters log to stderr through the
     # root logger. File handlers from setup_logging() keep working (level-independent).
     logging.disable(logging.CRITICAL)

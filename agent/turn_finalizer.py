@@ -728,6 +728,13 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    _usage_by_model = getattr(agent, "session_usage_by_model", None)
+    if isinstance(_usage_by_model, dict) and _usage_by_model:
+        result["usage_by_model"] = [
+            {"model": model_id, **counters}
+            for model_id, counters in _usage_by_model.items()
+            if isinstance(counters, dict)
+        ]
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True; also stamp `error` so the gateway

@@ -229,6 +229,10 @@ def record_response_usage(
         _agg_cost_model = _agg_slot["model"]
         _agg_cost_provider = _agg_slot.get("provider") or agent.provider
         _agg_cost_base_url = _agg_slot.get("base_url") or agent.base_url
+    # Paperclip per-turn route: price this call at the wire model when one was selected.
+    _wire_model = getattr(agent, "_paperclip_wire_model", None)
+    if isinstance(_wire_model, str) and _wire_model.strip():
+        _agg_cost_model = _wire_model.strip()
     cost_result = estimate_usage_cost(
         _agg_cost_model, aggregator_usage, provider=_agg_cost_provider,
         base_url=_agg_cost_base_url, api_key=getattr(agent, "api_key", ""),
@@ -250,6 +254,33 @@ def record_response_usage(
             _cost_delta = (_cost_delta or 0.0) + _moa_cost
     agent.session_cost_status = cost_result.status
     agent.session_cost_source = cost_result.source
+
+    # Paperclip routing: fold this call into usage_by_model keyed by the wire model.
+    # Top-level session counters and report ``model`` stay on the primary.
+    if getattr(agent, "_paperclip_model_route_active", False):
+        _uby_model = (
+            _wire_model.strip()
+            if isinstance(_wire_model, str) and _wire_model.strip()
+            else agent.model
+        )
+        buckets = getattr(agent, "session_usage_by_model", None)
+        if not isinstance(buckets, dict):
+            buckets = {}
+            agent.session_usage_by_model = buckets
+        part = buckets.get(_uby_model)
+        if not isinstance(part, dict):
+            part = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "estimated_cost_usd": 0.0,
+            }
+            buckets[_uby_model] = part
+        part["input_tokens"] += int(canonical_usage.input_tokens or 0)
+        part["output_tokens"] += int(canonical_usage.output_tokens or 0)
+        part["cache_read_tokens"] += int(canonical_usage.cache_read_tokens or 0)
+        if _cost_delta is not None:
+            part["estimated_cost_usd"] = float(part.get("estimated_cost_usd") or 0.0) + float(_cost_delta)
 
     # Persist per-call token deltas for any session_id so non-CLI runs can't lose
     # accounting; gateway/session-store writes use absolute totals and safely overwrite

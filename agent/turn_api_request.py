@@ -153,6 +153,13 @@ def build_request_payload(
         logger.warning("LLM request middleware failed; sending the request unmodified", exc_info=True)
         _original_api_kwargs = dict(api_kwargs)
         _llm_middleware_trace = []
+    # Paperclip opt-in: rewrite api_kwargs["model"] only (agent.model stays primary).
+    try:
+        from agent.paperclip_model_route import apply_paperclip_model_route
+
+        apply_paperclip_model_route(agent, api_kwargs)
+    except Exception:
+        logger.debug("paperclip model route failed; sending primary model", exc_info=True)
     return ApiRequestBuild(
         "fallthrough", api_messages, _moa_prepared_request, tools_for_api, api_kwargs,
         _original_api_kwargs, _llm_middleware_trace,

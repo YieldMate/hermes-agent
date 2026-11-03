@@ -33,6 +33,9 @@ def set_mcp_server_filter(toolsets: object) -> Optional[list[str]]:
     Built-in toolset names in the list are harmless (they never match a
     configured ``mcp_servers`` key). ``all``/``*`` or an empty/absent value
     clears the filter. Returns the stored list for logging/tests.
+
+    Toolset form ``mcp-<server>`` (what Paperclip and oneshot pass on ``-t``) also
+    allows the bare ``<server>`` config/overlay key used by discovery.
     """
     global _mcp_server_filter
     names: list[str] = []
@@ -44,7 +47,18 @@ def set_mcp_server_filter(toolsets: object) -> Optional[list[str]]:
     if not names or "all" in names or "*" in names:
         _mcp_server_filter = None
     else:
-        _mcp_server_filter = names
+        expanded: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            if name not in seen:
+                expanded.append(name)
+                seen.add(name)
+            if name.startswith("mcp-"):
+                bare = name[4:]
+                if bare and bare not in seen:
+                    expanded.append(bare)
+                    seen.add(bare)
+        _mcp_server_filter = expanded
     return _mcp_server_filter
 
 

@@ -618,7 +618,17 @@ def discover_mcp_tools(allowed_mcp_names: Optional[list[str]] = None) -> list[st
         logger.debug("No MCP servers configured")
         return []
     if allowed_mcp_names is not None:
-        allowed_set = {str(n) for n in allowed_mcp_names}
+        # Accept bare server keys and the ``mcp-<server>`` toolset form Paperclip passes on -t.
+        allowed_set: set[str] = set()
+        for raw in allowed_mcp_names:
+            name = str(raw).strip()
+            if not name:
+                continue
+            allowed_set.add(name)
+            if name.startswith("mcp-") and len(name) > 4:
+                allowed_set.add(name[4:])
+            else:
+                allowed_set.add(f"mcp-{name}")
         filtered = {name: cfg for name, cfg in servers.items() if name in allowed_set}
         if len(filtered) != len(servers):
             logger.debug("MCP discovery filter: spawning %d/%d configured server(s) per --toolsets filter "

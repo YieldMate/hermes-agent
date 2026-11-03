@@ -357,6 +357,19 @@ def test_set_mcp_server_filter_normalizes(_reset_mcp_server_filter, toolsets, ex
     assert mcp_startup.get_mcp_server_filter() == expected
 
 
+def test_set_mcp_server_filter_expands_mcp_toolset_prefix(_reset_mcp_server_filter):
+    """Paperclip passes ``mcp-<server>`` on -t; discovery keys are bare ``<server>``."""
+    assert mcp_startup.set_mcp_server_filter(
+        "terminal,mcp-paperclip-assigned,mcp-paperclip-projects"
+    ) == [
+        "terminal",
+        "mcp-paperclip-assigned",
+        "paperclip-assigned",
+        "mcp-paperclip-projects",
+        "paperclip-projects",
+    ]
+
+
 def test_discover_mcp_tools_spawns_only_allowed_servers(monkeypatch):
     """The filter must narrow the spawn set before any server is connected;
     built-in toolset names in the list are ignored."""

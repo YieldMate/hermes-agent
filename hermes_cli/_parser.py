@@ -213,6 +213,10 @@ def _add_top_level_flags(parser: argparse.ArgumentParser) -> None:
               help="Force the classic prompt_toolkit REPL (overrides display.interface=tui)")
     inherited(parser, "--dev", dest="tui_dev", action="store_true", default=False,
               help="With --tui: run TypeScript sources via tsx (skip dist build)")
+    inherited(parser, "--resident", action="store_true", default=False,
+              help="Paperclip resident mode: JSONL turns on stdin, keep one AIAgent alive across heartbeats.")
+    inherited(parser, "--resident-idle-sec", type=float, default=900.0, dest="resident_idle_sec",
+              help="Idle exit timeout in seconds for --resident (default 900).")
 
 
 def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
@@ -305,9 +309,9 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
         "Also configurable as agent.run_budget_seconds in config.yaml. "
         "Intended for one-shot/eval invocations with a hard ceiling."))
     inherited(chat_parser, "--resident", action="store_true", default=SUPPRESS,
-              help="Paperclip resident mode: JSONL turns on stdin, keep one AIAgent alive.")
-    inherited(chat_parser, "--resident-idle-sec", type=float, default=SUPPRESS,
-              help="Idle exit timeout for --resident (default 900).")
+              help="Paperclip resident mode: JSONL turns on stdin, keep one AIAgent alive across heartbeats.")
+    inherited(chat_parser, "--resident-idle-sec", type=float, default=SUPPRESS, dest="resident_idle_sec",
+              help="Idle exit timeout in seconds for --resident (default 900).")
     inherited(chat_parser, "--yolo", action="store_true", default=SUPPRESS,
               help="Bypass all dangerous command approval prompts (use at your own risk)")
     inherited(chat_parser, "--pass-session-id", action="store_true", default=SUPPRESS,
@@ -320,10 +324,6 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
               help="Troubleshooting mode: disable ALL customizations — user config, AGENTS.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules). Use to isolate whether a problem comes from your setup or from Hermes itself.")
     add("--source", default=None,
         help="Session source tag for filtering (default: cli). Use 'tool' for third-party integrations that should not appear in user session lists.")
-    add("--resident", action="store_true", default=False,
-        help="Paperclip resident mode: JSONL turns on stdin, keep one AIAgent alive across heartbeats.")
-    add("--resident-idle-sec", type=float, default=900.0, dest="resident_idle_sec",
-        help="Idle exit timeout in seconds for --resident (default 900).")
     inherited(chat_parser, "--tui", action="store_true", default=SUPPRESS,
               help="Launch the modern TUI instead of the classic REPL")
     inherited(chat_parser, "--native", "--tui-native", dest="tui_native", action="store_true", default=SUPPRESS,

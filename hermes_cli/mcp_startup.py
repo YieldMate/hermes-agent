@@ -156,16 +156,47 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
         thread.start()
 
 
+def _discovery_targets_include_stdio() -> bool:
+    """True when any MCP server this process will discover uses a stdio ``command``.
+
+    URL-only servers (HTTP/SSE, including ``HERMES_MCP_OVERLAY``) connect quickly; the
+    15s one-shot wait exists for stdio cold starts. Fail closed (True) on any error so a
+    broken config still gets the longer bound.
+    """
+    try:
+        from tools.mcp_tool_config import _load_mcp_config
+
+        servers = _load_mcp_config()
+        if not isinstance(servers, dict) or not servers:
+            return False
+        names = list(servers.keys())
+        if _mcp_server_filter is not None:
+            names = [name for name in names if name in _mcp_server_filter]
+        for name in names:
+            cfg = servers.get(name)
+            if isinstance(cfg, dict) and str(cfg.get("command") or "").strip():
+                return True
+        return False
+    except Exception:
+        return True
+
+
 def _resolve_discovery_timeout(explicit: float | None, *, single_query: bool = False) -> float:
     """Resolve the MCP discovery wait bound: explicit arg > config.yaml > ``DEFAULT_CONFIG``.
 
     Lazy and fail-safe: a missing/invalid value or broken config falls back to a short bound so
     startup can never hang or crash.
+
+    One-shot sessions normally use the larger ``mcp_single_query_discovery_timeout`` (15s)
+    because there is no later turn to recover. When every discovery target is URL-based
+    (HTTP/SSE overlay or config, no stdio ``command``), use the interactive 1.5s bound
+    instead — those connects do not need the stdio cold-start ceiling.
     """
     if explicit is not None:
         return explicit
-    key = "mcp_single_query_discovery_timeout" if single_query else "mcp_discovery_timeout"
-    fallback = 15.0 if single_query else 1.5
+    use_single_query = single_query and _discovery_targets_include_stdio()
+    key = "mcp_single_query_discovery_timeout" if use_single_query else "mcp_discovery_timeout"
+    fallback = 15.0 if use_single_query else 1.5
     try:
         from hermes_cli.config import load_config, DEFAULT_CONFIG
 

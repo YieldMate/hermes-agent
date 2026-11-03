@@ -122,3 +122,24 @@ def test_apply_rewrites_model_and_sticks_after_tools(route_env, monkeypatch):
     kwargs3 = {"model": "primary-model", "messages": [{"role": "user", "content": "again"}]}
     apply_paperclip_model_route(agent, kwargs3)
     assert kwargs3["model"] == "primary-model"
+
+
+def test_token_estimate_failure_fails_closed_to_primary(route_env, monkeypatch):
+    def boom(api_kwargs, messages):
+        raise RuntimeError("estimate failed")
+
+    monkeypatch.setattr("agent.paperclip_model_route._rough_input_tokens", boom)
+    agent = type("A", (), {"model": "primary-model"})()
+    kwargs = {"model": "primary-model", "messages": [{"role": "user", "content": "hi"}]}
+    apply_paperclip_model_route(agent, kwargs)
+    assert kwargs["model"] == "primary-model"
+    assert agent._paperclip_model_route_locked is True
+    assert agent._paperclip_wire_model == "primary-model"
+
+
+def test_bypass_skips_paperclip_routing(route_env):
+    agent = type("A", (), {"model": "primary-model", "_paperclip_model_route_bypass": True})()
+    kwargs = {"model": "primary-model", "messages": [{"role": "user", "content": "hi"}]}
+    apply_paperclip_model_route(agent, kwargs)
+    assert kwargs["model"] == "primary-model"
+    assert getattr(agent, "_paperclip_wire_model", None) is None

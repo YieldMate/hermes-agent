@@ -209,9 +209,16 @@ def record_response_usage(
     _upstream = getattr(response, "provider", None)
     if isinstance(_upstream, str) and _upstream:
         _ident += f" upstream={_upstream}"
+    # Paperclip per-turn route: prefer the wire model for logs/cost/persistence when set.
+    _wire_model = getattr(agent, "_paperclip_wire_model", None)
+    _log_model = (
+        _wire_model.strip()
+        if isinstance(_wire_model, str) and _wire_model.strip()
+        else agent.model
+    )
     logger.info(
         "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s%s",
-        agent.session_api_calls, agent.model, agent.provider or "unknown",
+        agent.session_api_calls, _log_model, agent.provider or "unknown",
         prompt_tokens, completion_tokens, total_tokens,
         api_duration, _cache_pct, _ident,
     )
@@ -230,7 +237,6 @@ def record_response_usage(
         _agg_cost_provider = _agg_slot.get("provider") or agent.provider
         _agg_cost_base_url = _agg_slot.get("base_url") or agent.base_url
     # Paperclip per-turn route: price this call at the wire model when one was selected.
-    _wire_model = getattr(agent, "_paperclip_wire_model", None)
     if isinstance(_wire_model, str) and _wire_model.strip():
         _agg_cost_model = _wire_model.strip()
     cost_result = estimate_usage_cost(
@@ -307,7 +313,7 @@ def record_response_usage(
                 billing_base_url=agent.base_url,
                 billing_mode="subscription_included"
                 if cost_result.status == "included" else None,
-                model=agent.model,
+                model=_log_model,
                 api_call_count=1,
                 task=getattr(agent, "_turn_route_task", "") or "",
             )

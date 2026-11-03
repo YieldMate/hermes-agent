@@ -1635,6 +1635,12 @@ def cmd_chat(args):
     """Run interactive chat CLI."""
     from utils import env_var_enabled
 
+    # Paperclip resident worker: one AIAgent, many JSONL turns on stdin.
+    if getattr(args, "resident", False):
+        from hermes_cli.resident import cmd_resident_from_args
+        cmd_resident_from_args(args)
+        return
+
     # In-process one-shot: a non-empty -q under HERMES_INPROCESS_CHAT runs the turn here
     # (same path as ``_run_and_exit_oneshot``) and never continues into the shared gateway.
     # Interactive chat, TUI, and chat without -q stay on the gateway.

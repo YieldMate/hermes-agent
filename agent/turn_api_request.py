@@ -60,6 +60,9 @@ def _fire_pre_api_request_hook(
             # ``request_messages``/``conversation_history`` are raw langfuse passthroughs.
             # Anthropic (``system``) and Responses/Codex (``instructions``) move the system
             # prompt out of messages; pass it for observability.
+            wire_model = api_kwargs.get("model") if isinstance(api_kwargs, dict) else None
+            if not isinstance(wire_model, str) or not wire_model.strip():
+                wire_model = agent.model
             _invoke_hook(
                 "pre_api_request",
                 task_id=effective_task_id,
@@ -69,7 +72,7 @@ def _fire_pre_api_request_hook(
                 user_message=original_user_message,
                 conversation_history=list(messages),
                 platform=agent.platform or "",
-                model=agent.model,
+                model=wire_model,
                 provider=agent.provider,
                 base_url=agent.base_url,
                 api_mode=agent.api_mode,
@@ -137,12 +140,23 @@ def build_request_payload(
     if getattr(agent, "_is_user_initiated_turn", False) and agent._is_copilot_url():
         _set_extra_header(api_kwargs, "x-initiator", "user")
         agent._is_user_initiated_turn = False
+    # Paperclip opt-in: rewrite api_kwargs["model"] before middleware/hooks observe it
+    # (agent.model stays primary for resume / session route).
+    try:
+        from agent.paperclip_model_route import apply_paperclip_model_route
+
+        apply_paperclip_model_route(agent, api_kwargs)
+    except Exception:
+        logger.debug("paperclip model route failed; sending primary model", exc_info=True)
+    wire_model = api_kwargs.get("model") if isinstance(api_kwargs, dict) else None
+    if not isinstance(wire_model, str) or not wire_model.strip():
+        wire_model = agent.model
     try:
         from hermes_cli.middleware import apply_llm_request_middleware
 
         _llm_request_mw = apply_llm_request_middleware(
             api_kwargs, task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
-            session_id=agent.session_id or "", platform=agent.platform or "", model=agent.model,
+            session_id=agent.session_id or "", platform=agent.platform or "", model=wire_model,
             provider=agent.provider, base_url=agent.base_url, api_mode=agent.api_mode,
             api_call_count=api_call_count,
         )
@@ -153,13 +167,6 @@ def build_request_payload(
         logger.warning("LLM request middleware failed; sending the request unmodified", exc_info=True)
         _original_api_kwargs = dict(api_kwargs)
         _llm_middleware_trace = []
-    # Paperclip opt-in: rewrite api_kwargs["model"] only (agent.model stays primary).
-    try:
-        from agent.paperclip_model_route import apply_paperclip_model_route
-
-        apply_paperclip_model_route(agent, api_kwargs)
-    except Exception:
-        logger.debug("paperclip model route failed; sending primary model", exc_info=True)
     return ApiRequestBuild(
         "fallthrough", api_messages, _moa_prepared_request, tools_for_api, api_kwargs,
         _original_api_kwargs, _llm_middleware_trace,

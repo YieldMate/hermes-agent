@@ -154,6 +154,8 @@ def _send(fork: Any, capture: SideQuestionCapture, prompt: str, audit: _Audit) -
         _plugin_user_context=None, moa_config=None, active_system_prompt=fork._cached_system_prompt,
         original_user_message=prompt, pending_moa_prepared_request=None, request_logger=logger,
     )
+    # Side questions must not inherit HERMES_PAPERCLIP_MODEL_ROUTE (cheap rewrite).
+    fork._paperclip_model_route_bypass = True
     built = build_request_payload(
         fork, api_messages=assembled.api_messages, _moa_prepared_request=None,
         tools_for_api=assembled.tools_for_api, system_message=None, api_call_count=1,

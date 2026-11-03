@@ -513,8 +513,29 @@ def _apply_stored_session_runtime(
     return choice
 
 
-def _run_agent(
-    prompt: str,
+@dataclass
+class LiveOneshotAgent:
+    """Long-lived oneshot/resident handle: one AIAgent across many turns."""
+
+    agent: object
+    session_db: object
+    relay_session_id: Optional[str]
+    model: Optional[str]
+    provider: Optional[str]
+    toolsets: object
+    skills: object
+    conversation_history: Optional[list]
+
+
+def _ephemeral_system_prompt_for_turn(skills: object = None) -> Optional[str]:
+    skills_prompt = _build_preloaded_skills_prompt(skills)
+    env_ephemeral = (os.getenv("HERMES_EPHEMERAL_SYSTEM_PROMPT") or "").strip()
+    ephemeral_parts = [part for part in (env_ephemeral, skills_prompt) if part]
+    return "\n\n".join(ephemeral_parts) or None
+
+
+def open_live_oneshot_agent(
+    *,
     model: Optional[str] = None,
     provider: Optional[str] = None,
     toolsets: object = None,
@@ -522,11 +543,8 @@ def _run_agent(
     skills: object = None,
     resume: Optional[str] = None,
     reasoning: object = None,
-    ledger: bool = False,
-) -> tuple[str, dict]:
-    """Build an AIAgent exactly like a normal CLI chat turn, run one conversation, and return
-    ``(final_response, run_result)``. Imports are local to keep CLI startup cheap. *ledger* (set when
-    ``--usage-file`` is requested) attaches this run's auxiliary usage to the result."""
+) -> LiveOneshotAgent:
+    """Build an AIAgent + session store without running a turn (for resident reuse)."""
     from hermes_cli.config import load_config
     from hermes_cli.runtime_provider import resolve_runtime_with_fallback
     from hermes_cli.tools_config import _get_platform_tools
@@ -573,10 +591,6 @@ def _run_agent(
 
     # Oneshot builds AIAgent directly, bypassing cli.py's MCP background discovery and
     # _init_agent's wait, so the construction-time tool snapshot would miss late MCP servers.
-    # Idempotent start + bounded wait with the single-query bound (there is no later turn).
-    # Ensure MCP tools are discovered before building the agent. This helper starts discovery if needed
-    # (idempotent) and bounded-waits with the larger single-query bound (default 15s) because there is only
-    # ONE turn and no between-turns late-binding refresh (#38448).
     from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
 
     ensure_mcp_discovery_before_agent_build(logger=logging.getLogger(__name__), single_query=True)
@@ -596,58 +610,115 @@ def _run_agent(
         except Exception:
             logging.debug("oneshot: MCP overlay toolset merge failed", exc_info=True)
 
-    skills_prompt = _build_preloaded_skills_prompt(skills)
-    env_ephemeral = (os.getenv("HERMES_EPHEMERAL_SYSTEM_PROMPT") or "").strip()
-    ephemeral_parts = [part for part in (env_ephemeral, skills_prompt) if part]
-    ephemeral_system_prompt = "\n\n".join(ephemeral_parts) or None
+    ephemeral_system_prompt = _ephemeral_system_prompt_for_turn(skills)
+    agent = AIAgent(
+        api_key=runtime.get("api_key"),
+        base_url=runtime.get("base_url"),
+        provider=runtime.get("provider"),
+        requested_provider=runtime.get("requested_provider"),
+        api_mode=runtime.get("api_mode"),
+        model=choice.model,
+        enabled_toolsets=toolsets_list,
+        quiet_mode=True,
+        platform="cli",
+        session_db=session_db,
+        session_id=resume_sid,
+        credential_pool=runtime.get("credential_pool"),
+        fallback_model=get_fallback_chain(cfg) or None,
+        # The resolved provider's request body (a custom entry's extra_body), as `hermes chat` passes it.
+        request_overrides=runtime.get("request_overrides"),
+        ephemeral_system_prompt=ephemeral_system_prompt,
+        reasoning_config=reasoning_config,
+        # The only interactive callback wired: no user sits at a terminal. Sudo prompts gate on
+        # HERMES_INTERACTIVE (never set), hook approval via HERMES_ACCEPT_HOOKS=1, dangerous
+        # commands via HERMES_YOLO_MODE=1, skill secret capture degrades gracefully.
+        clarify_callback=_oneshot_clarify_callback,
+    )
+    # Belt-and-braces: no streaming display callbacks may bypass our stdout capture.
+    agent.suppress_status_output = True
+    agent.stream_delta_callback = None
+    agent.tool_gen_callback = None
+    return LiveOneshotAgent(
+        agent=agent,
+        session_db=session_db,
+        relay_session_id=getattr(agent, "session_id", None),
+        model=model,
+        provider=provider,
+        toolsets=toolsets,
+        skills=skills,
+        conversation_history=conversation_history or None,
+    )
 
-    # The try spans agent construction (not just ``chat``) so the store is always closed, even when
-    # ``AIAgent(...)`` raises — the one-shot exit path hard-exits via os._exit and skips finalizers.
-    agent = relay_session_id = None
-    try:
-        agent = AIAgent(
-            api_key=runtime.get("api_key"),
-            base_url=runtime.get("base_url"),
-            provider=runtime.get("provider"),
-            requested_provider=runtime.get("requested_provider"),
-            api_mode=runtime.get("api_mode"),
-            model=choice.model,
-            enabled_toolsets=toolsets_list,
-            quiet_mode=True,
-            platform="cli",
-            session_db=session_db,
-            session_id=resume_sid,
-            credential_pool=runtime.get("credential_pool"),
-            fallback_model=get_fallback_chain(cfg) or None,
-            # The resolved provider's request body (a custom entry's extra_body), as `hermes chat` passes it.
-            request_overrides=runtime.get("request_overrides"),
-            ephemeral_system_prompt=ephemeral_system_prompt,
-            reasoning_config=reasoning_config,
-            # The only interactive callback wired: no user sits at a terminal. Sudo prompts gate on
-            # HERMES_INTERACTIVE (never set), hook approval via HERMES_ACCEPT_HOOKS=1, dangerous
-            # commands via HERMES_YOLO_MODE=1, skill secret capture degrades gracefully.
-            clarify_callback=_oneshot_clarify_callback,
+
+def run_live_oneshot_turn(
+    handle: LiveOneshotAgent,
+    prompt: str,
+    *,
+    ledger: bool = False,
+) -> tuple[str, dict]:
+    """Run one conversation turn on an existing live agent, rebinding ephemeral prompt from env."""
+    agent = handle.agent
+    session_db = handle.session_db
+    agent.ephemeral_system_prompt = _ephemeral_system_prompt_for_turn(handle.skills)
+    history = getattr(agent, "_session_messages", None) or handle.conversation_history
+    aux_before = _auxiliary_usage(session_db, getattr(agent, "session_id", None)) if ledger else {}
+    # Relay keys the root conversation to the id at turn entry; compression may rotate
+    # agent.session_id mid-turn without opening a second root, so keep the entry id.
+    if handle.relay_session_id is None:
+        handle.relay_session_id = getattr(agent, "session_id", None)
+    result = agent.run_conversation(prompt, conversation_history=history or None)
+    if not isinstance(result, dict):
+        result = {}
+    if getattr(agent, "session_id", None):
+        result["session_id"] = agent.session_id
+    # Subsequent turns continue from the in-memory message list, not the initial resume snapshot.
+    handle.conversation_history = getattr(agent, "_session_messages", None) or history
+    if ledger:
+        _attach_auxiliary_usage(
+            result,
+            session_db,
+            aux_before,
+            fallback_session_id=agent.session_id or handle.relay_session_id,
         )
-        # Belt-and-braces: no streaming display callbacks may bypass our stdout capture.
-        agent.suppress_status_output = True
-        agent.stream_delta_callback = None
-        agent.tool_gen_callback = None
+    return (result.get("final_response") or "", result)
 
-        aux_before = _auxiliary_usage(session_db, resume_sid) if ledger else {}
-        # Relay keys the root conversation to the id at turn entry; compression may rotate
-        # agent.session_id mid-turn without opening a second root, so keep the entry id.
-        relay_session_id = getattr(agent, "session_id", None)
-        result = agent.run_conversation(prompt, conversation_history=conversation_history or None)
-        if not isinstance(result, dict):
-            result = {}
-        if getattr(agent, "session_id", None):
-            result["session_id"] = agent.session_id
-        if ledger:
-            _attach_auxiliary_usage(result, session_db, aux_before,
-                                    fallback_session_id=agent.session_id or resume_sid)
-        return (result.get("final_response") or "", result)
+
+def close_live_oneshot_agent(handle: Optional[LiveOneshotAgent]) -> None:
+    if handle is None:
+        return
+    _close_agent(handle.agent, handle.session_db, handle.relay_session_id)
+
+
+def _run_agent(
+    prompt: str,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    toolsets: object = None,
+    use_config_toolsets: bool = True,
+    skills: object = None,
+    resume: Optional[str] = None,
+    reasoning: object = None,
+    ledger: bool = False,
+) -> tuple[str, dict]:
+    """Build an AIAgent exactly like a normal CLI chat turn, run one conversation, and return
+    ``(final_response, run_result)``. Imports are local to keep CLI startup cheap. *ledger* (set when
+    ``--usage-file`` is requested) attaches this run's auxiliary usage to the result."""
+    handle = None
+    try:
+        handle = open_live_oneshot_agent(
+            model=model,
+            provider=provider,
+            toolsets=toolsets,
+            use_config_toolsets=use_config_toolsets,
+            skills=skills,
+            resume=resume,
+            reasoning=reasoning,
+        )
+        return run_live_oneshot_turn(handle, prompt, ledger=ledger)
     finally:
-        _close_agent(agent, session_db, relay_session_id)
+        # The try spans agent construction (not just ``chat``) so the store is always closed, even when
+        # ``AIAgent(...)`` raises — the one-shot exit path hard-exits via os._exit and skips finalizers.
+        close_live_oneshot_agent(handle)
 
 
 def _quietly(what: str, fn) -> None:

@@ -131,14 +131,21 @@ def apply_paperclip_model_route(agent: Any, api_kwargs: Any) -> None:
     if not isinstance(api_kwargs, dict):
         return
 
+    # Side-question / auxiliary forks must stay on the primary session model.
+    if getattr(agent, "_paperclip_model_route_bypass", False):
+        if hasattr(agent, "_paperclip_wire_model"):
+            agent._paperclip_wire_model = None
+        return
+
     agent._paperclip_model_route_active = True
     messages = _request_messages(api_kwargs)
     locked = bool(getattr(agent, "_paperclip_model_route_locked", False))
     try:
         approx = _rough_input_tokens(api_kwargs, messages)
     except Exception:
-        logger.debug("paperclip model route token estimate failed", exc_info=True)
-        approx = 0
+        # Fail closed: treat the estimate as at-cap so we stick to primary.
+        logger.debug("paperclip model route token estimate failed; using primary", exc_info=True)
+        approx = route["maxCheapInputTokens"]
 
     wire, now_locked = choose_paperclip_wire_model(
         route, messages=messages, approx_tokens=approx, locked=locked,

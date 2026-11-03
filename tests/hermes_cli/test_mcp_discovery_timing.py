@@ -47,6 +47,7 @@ def test_resolve_discovery_timeout_single_query_uses_larger_bound(monkeypatch):
     """Single-query mode reads the larger mcp_single_query_discovery_timeout."""
     import hermes_cli.config as cfg
 
+    monkeypatch.setattr(mcp_startup, "_discovery_targets_include_stdio", lambda: True)
     monkeypatch.setattr(
         cfg,
         "load_config",
@@ -62,6 +63,7 @@ def test_resolve_discovery_timeout_single_query_falls_back(monkeypatch):
     """Bad/absent single-query value falls back to DEFAULT_CONFIG, never hangs."""
     import hermes_cli.config as cfg
 
+    monkeypatch.setattr(mcp_startup, "_discovery_targets_include_stdio", lambda: True)
     default = float(cfg.DEFAULT_CONFIG.get("mcp_single_query_discovery_timeout", 15.0))
     monkeypatch.setattr(
         cfg, "load_config", lambda: {"mcp_single_query_discovery_timeout": 0}
@@ -79,6 +81,38 @@ def test_resolve_discovery_timeout_single_query_falls_back(monkeypatch):
 def test_resolve_discovery_timeout_explicit_overrides_single_query():
     """An explicit timeout always wins, even in single-query mode."""
     assert mcp_startup._resolve_discovery_timeout(5.0, single_query=True) == 5.0
+
+
+def test_resolve_discovery_timeout_http_only_uses_short_bound(monkeypatch):
+    """URL-only MCP (Paperclip overlay) must not pay the 15s stdio one-shot wait."""
+    import hermes_cli.config as cfg
+
+    monkeypatch.setattr(
+        cfg,
+        "load_config",
+        lambda: {
+            "mcp_discovery_timeout": 1.5,
+            "mcp_single_query_discovery_timeout": 25.0,
+        },
+    )
+    monkeypatch.setattr(mcp_startup, "_discovery_targets_include_stdio", lambda: False)
+    assert mcp_startup._resolve_discovery_timeout(None, single_query=True) == 1.5
+
+
+def test_resolve_discovery_timeout_stdio_keeps_long_bound(monkeypatch):
+    """Stdio MCP servers still use the single-query ceiling."""
+    import hermes_cli.config as cfg
+
+    monkeypatch.setattr(
+        cfg,
+        "load_config",
+        lambda: {
+            "mcp_discovery_timeout": 1.5,
+            "mcp_single_query_discovery_timeout": 25.0,
+        },
+    )
+    monkeypatch.setattr(mcp_startup, "_discovery_targets_include_stdio", lambda: True)
+    assert mcp_startup._resolve_discovery_timeout(None, single_query=True) == 25.0
 
 # ── ensure_mcp_discovery_before_agent_build ─────────────────────────────────
 

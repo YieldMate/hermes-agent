@@ -35,6 +35,10 @@ _USAGE_KEYS = (
     "usage_by_model",
 )
 
+# Hot tool pinning v1 telemetry (``tools.hot_tool_pinning``): merged into the report only when the
+# flag is on, so a flag-off report keeps its historical shape.
+_HOT_PINNING_KEYS = ("tool_search_calls", "tool_describe_calls", "tool_calls_total", "pinned_schema_tokens")
+
 # Counters summed per auxiliary task (vision, compression, title_generation, ...) into the
 # ``auxiliary`` block of the report. The main-loop keys above stay main-loop-only (backward
 # compatible); ``total_including_auxiliary`` carries the grand total pipelines bill on (#112848).
@@ -240,6 +244,15 @@ def _validate_explicit_toolsets(toolsets: object = None) -> tuple[list[str] | No
     return valid, None
 
 
+def _hot_pinning_report(result: dict) -> dict:
+    """Hot-pinning counters for the usage report: the live process snapshot (this call is the
+    single point where the run's telemetry is collected), else values already on ``result``."""
+    from tools import hot_tool_pinning
+    if hot_tool_pinning.is_hot_tool_pinning_v1_enabled():
+        result.update(hot_tool_pinning.snapshot_hot_pinning_telemetry())
+    return {key: result[key] for key in _HOT_PINNING_KEYS if key in result}
+
+
 def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] = None) -> None:
     """Best-effort JSON usage report for pipelines (``-z --usage-file``).
 
@@ -250,6 +263,7 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         return
     try:
         report = {key: result.get(key) for key in _USAGE_KEYS}
+        report.update(_hot_pinning_report(result))
         report["failed"] = bool(result.get("failed")) or failure is not None
         report["service_tier"] = result.get("service_tier")
         if isinstance(result.get("auxiliary_usage"), dict):

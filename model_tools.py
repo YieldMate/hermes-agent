@@ -18,6 +18,7 @@ import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
+from tools import hot_tool_pinning
 from tools.registry import CHECK_FN_CACHE_BYPASS, check_fn_cache_scope, discover_builtin_tools, registry, tool_error
 from tools.registry import _MAX_TOOL_ERROR_CHARS as _TOOL_ERROR_MAX_LEN
 from toolsets import resolve_toolset, validate_toolset
@@ -887,6 +888,7 @@ def handle_function_call(
     function_name = _LEGACY_TOOL_ALIASES.get(function_name, function_name)
     ids = _CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id)
     start = time.monotonic()
+    hot_tool_pinning.record_tool_call(function_name)
 
     def _emit(result: Any, **extra: Any) -> Any:
         """Emit post_tool_call with this call's identity fields; returns *result*."""
@@ -904,6 +906,8 @@ def handle_function_call(
             return _emit(result, duration_ms=_elapsed_ms(start))
         from tools.connectors import CONNECTOR_BATCH_SENTINEL, dispatch_connector_batch
         if underlying[0] == CONNECTOR_BATCH_SENTINEL:
+            for entry in underlying[1]["calls"]:
+                hot_tool_pinning.record_tool_call(entry["name"])
             return _emit(dispatch_connector_batch(
                 underlying[1]["calls"], ids, user_task=user_task,
                 enabled_tools=enabled_tools, middleware_trace=trace,

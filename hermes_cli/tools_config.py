@@ -893,6 +893,25 @@ def _estimate_tool_tokens() -> dict[str, int]:
     return counts
 
 
+def estimate_schema_tokens(schema: dict) -> int:
+    """cl100k_base tokens for one OpenAI function schema (wire shape).
+
+    Falls back to the chars/4 rule when tiktoken is not installed (it is not a core dependency),
+    so callers get an order-of-magnitude figure instead of an error."""
+    wire = _json.dumps({"type": "function", "function": schema})
+    try:
+        import tiktoken
+        return len(tiktoken.get_encoding("cl100k_base").encode(wire))
+    except (ImportError, OSError):  # not installed, or the encoding file cannot be fetched offline
+        logger.debug("tiktoken unavailable; estimating schema tokens as chars/4")
+        return -(-len(wire) // 4)
+
+
+def sum_pinned_schema_tokens(schemas) -> int:
+    """Total :func:`estimate_schema_tokens` over an iterable of function schemas."""
+    return sum(estimate_schema_tokens(schema) for schema in schemas)
+
+
 def _prompt_toolset_checklist(platform_label: str, enabled: set[str], platform: str = "cli", *, force_fresh: bool = True) -> set[str]:
     """Multi-select checklist of toolsets. Returns set of selected toolset keys."""
     from hermes_cli.curses_ui import curses_checklist

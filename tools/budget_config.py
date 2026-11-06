@@ -28,8 +28,11 @@ def _configured_mcp_result_size() -> int:
     Any error, missing key or non-positive value returns the built-in default.
 
     The ``tool_budget:`` block name is shared with the wider configurable-caps proposal (#80508) so the two
-    can merge without a key rename.
+    can merge without a key rename. Hot tool pinning v1 overrides the config with its fixed threshold.
     """
+    from tools import hot_tool_pinning
+    if hot_tool_pinning.is_hot_tool_pinning_v1_enabled():
+        return hot_tool_pinning.HOT_PINNING_MCP_RESULT_SIZE_CHARS
     try:
         from hermes_cli.config import load_config_readonly
         data = load_config_readonly()
@@ -40,6 +43,13 @@ def _configured_mcp_result_size() -> int:
     except Exception:
         pass
     return DEFAULT_MCP_RESULT_SIZE_CHARS
+
+
+def _configured_mcp_result_size_if_pinned(configured: int) -> int:
+    from tools import hot_tool_pinning
+    if hot_tool_pinning.is_hot_tool_pinning_v1_enabled():
+        return hot_tool_pinning.HOT_PINNING_MCP_RESULT_SIZE_CHARS
+    return configured
 
 
 @dataclass(frozen=True)
@@ -67,7 +77,8 @@ class BudgetConfig:
         if tool_name in self.tool_overrides:
             return self.tool_overrides[tool_name]
         if tool_name.startswith(MCP_TOOL_PREFIX):
-            return min(self.mcp_result_size, self.default_result_size)
+            # Re-read the flag here: ``DEFAULT_BUDGET`` was built at import, before it could be set.
+            return min(_configured_mcp_result_size_if_pinned(self.mcp_result_size), self.default_result_size)
         from tools.registry import registry
         registry_value = registry.get_max_result_size(tool_name, default=self.default_result_size)
         if registry_value == float("inf"):

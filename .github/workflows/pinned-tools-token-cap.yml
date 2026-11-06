@@ -1,0 +1,42 @@
+name: Pinned Tools Token Cap
+
+# Job `pinned-tools-token-cap`: every overlays/**/pinned-tools.json manifest must keep its pinned
+# MCP tool schemas under 10,000 cl100k_base tokens (hot tool pinning v1, YIE-70).
+#
+# Runs on every pull request, not only when a manifest changes: the cap also depends on
+# scripts/ci/pinned_tools_token_cap.py and the token estimator, and the check is a few seconds
+# of plain Python. With no overlays/ directory it passes.
+
+on:
+  pull_request:
+  workflow_call:
+    inputs:
+      commit:
+        description: Commit to test and build. Empty keeps the triggering commit.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  pinned-tools-token-cap:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+        with:
+          ref: ${{ inputs.commit }}
+
+      - name: Set up locked Python and test dependencies
+        uses: ./.github/actions/setup-pm
+        with:
+          test-environment: 'true'
+
+      - name: Install the tokenizer
+        # tiktoken is not a Hermes dependency; the disposable CI test environment gets it so the
+        # cap is measured with the same cl100k_base encoder the runtime uses.
+        run: uv pip install --python "$HERMES_PYTHON" tiktoken==0.12.0
+
+      - name: Check pinned tool schema token caps
+        run: '"$HERMES_PYTHON" scripts/ci/pinned_tools_token_cap.py --require-tiktoken'

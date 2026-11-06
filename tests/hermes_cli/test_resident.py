@@ -430,3 +430,86 @@ def test_resident_writes_usage_file_and_clears_pinning_state(tmp_path, monkeypat
     assert flag_during_turn == [True, True, False]
     assert hot_tool_pinning.describe_cache_size() == 0
     assert not hot_tool_pinning.is_hot_tool_pinning_v1_enabled()
+
+
+def test_resident_rebuilds_when_flag_or_pins_change(tmp_path, monkeypatch):
+    """Flag off→on (or pin-set change) must rebuild so agent.tools matches frozen pins."""
+    from hermes_cli import resident
+    from hermes_cli import oneshot
+    from tools import hot_tool_pinning
+
+    hot_tool_pinning.clear_hot_pinning_runtime_state()
+    opens = {"n": 0}
+    pins_at_open = []
+    tokens_during_turn = []
+
+    class FakeHandle:
+        def __init__(self):
+            self.agent = object()
+
+    def fake_open(**kw):
+        opens["n"] += 1
+        pins_at_open.append(sorted(hot_tool_pinning.pinned_tool_names()))
+        return FakeHandle()
+
+    def fake_run(handle, prompt, *, ledger=False):
+        tokens_during_turn.append(hot_tool_pinning.pinned_schema_tokens())
+        return "ok", {"session_id": "sess", "completed": True, "input_tokens": 1}
+
+    monkeypatch.setattr(oneshot, "open_live_oneshot_agent", fake_open)
+    monkeypatch.setattr(oneshot, "run_live_oneshot_turn", fake_run)
+    monkeypatch.setattr(oneshot, "close_live_oneshot_agent", lambda h: None)
+    monkeypatch.setattr(oneshot, "_normalize_toolsets", lambda v: None)
+
+    pin_a = tmp_path / "a.json"
+    pin_b = tmp_path / "b.json"
+    schema = {"name": "t", "description": "d", "parameters": {}}
+    pin_a.write_text(json.dumps({
+        "version": 1,
+        "tools": [{"name": "mcp_hot_a", "callCount": 5, "schema": {**schema, "name": "mcp_hot_a"}}],
+    }))
+    pin_b.write_text(json.dumps({
+        "version": 1,
+        "tools": [{"name": "mcp_hot_b", "callCount": 9, "schema": {**schema, "name": "mcp_hot_b"}}],
+    }))
+
+    lines = [
+        # Build with flag off (no pins).
+        json.dumps({"prompt": "1", "env": {}}),
+        # Flag on with pin A → must rebuild + freeze A.
+        json.dumps({
+            "prompt": "2",
+            "env": {
+                "HERMES_HOT_TOOL_PINNING_V1": "1",
+                "HERMES_PINNED_TOOLS_FILE": str(pin_a),
+            },
+        }),
+        # Same pins → reuse (no rebuild).
+        json.dumps({
+            "prompt": "3",
+            "env": {
+                "HERMES_HOT_TOOL_PINNING_V1": "1",
+                "HERMES_PINNED_TOOLS_FILE": str(pin_a),
+            },
+        }),
+        # Different pin set → rebuild + freeze B.
+        json.dumps({
+            "prompt": "4",
+            "env": {
+                "HERMES_HOT_TOOL_PINNING_V1": "1",
+                "HERMES_PINNED_TOOLS_FILE": str(pin_b),
+            },
+        }),
+        json.dumps({"shutdown": True}),
+    ]
+    monkeypatch.setattr(resident.sys, "stdin", io.StringIO("\n".join(lines) + "\n"))
+    monkeypatch.setattr(resident.sys, "stdout", io.StringIO())
+
+    assert resident.run_resident(idle_sec=60) == 0
+    assert opens["n"] == 3  # off build, on+A, on+B (turn 3 reused)
+    assert pins_at_open == [[], ["mcp_hot_a"], ["mcp_hot_b"]]
+    # Turns 2–4 are flag-on; freeze must retain schema tokens (not zero the override path).
+    assert tokens_during_turn[0] == 0
+    assert tokens_during_turn[1] > 0
+    assert tokens_during_turn[2] == tokens_during_turn[1]
+    assert tokens_during_turn[3] > 0

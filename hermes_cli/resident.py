@@ -145,7 +145,18 @@ def _write_resident_usage(result: dict, failure: Optional[str] = None) -> None:
 
 
 def _fingerprint(model, provider, toolsets) -> tuple:
-    return (model or None, provider or None, toolsets if toolsets is not None else None)
+    """Rebuild identity: model/provider/toolsets plus the pin set this turn's env asks for.
+
+    Flag or pin-set changes must rebuild the agent so ``agent.tools`` and dispatch gates stay aligned
+    (freeze happens at build time only).
+    """
+    from tools.hot_tool_pinning import desired_pin_fingerprint
+    return (
+        model or None,
+        provider or None,
+        toolsets if toolsets is not None else None,
+        desired_pin_fingerprint(),
+    )
 
 
 def _stdin_readable(timeout: float) -> bool:

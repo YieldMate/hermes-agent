@@ -946,7 +946,9 @@ class ClientLifecycleMixin:
             with suppress(Exception):
                 from providers import get_provider_profile
                 profile = get_provider_profile(self.provider)
-                if profile and profile.default_headers and (profile_headers := dict(profile.default_headers)):
+                if profile and profile.default_headers and (
+                    profile_headers := profile.resolved_default_headers()
+                ):
                     self._client_kwargs["default_headers"] = profile_headers
         # User overrides win over URL/profile defaults for the same route; a swap to another endpoint must not
         # inherit them.

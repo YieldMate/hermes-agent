@@ -266,42 +266,187 @@ def _git_version_info(repo_dir: Path, *, include_untracked: bool = False) -> Ver
 # --- Cache + public API -----------------------------------------------------
 
 _cached_version_info: VersionInfo | None = None
+# Cross-process memo of the last resolution. Stamp reads are already cheap; the
+# disk cache mainly avoids repeating the multi-git-subprocess path on unstamped
+# checkouts (and after a rejected source=git stamp) within the TTL (YIE-66).
+_DISK_CACHE_TTL_SECONDS = 3600
+_DISK_CACHE_SCHEMA = 1
+
+
+def _disk_cache_path() -> Path | None:
+    try:
+        from hermes_constants import get_process_hermes_home
+
+        return get_process_hermes_home() / "cache" / "version_info.json"
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _clear_disk_cache() -> None:
+    path = _disk_cache_path()
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
 
 
 def _reset_version_info_cache() -> None:
-    """Test-only cache reset."""
+    """Drop process + disk memos (tests, stamp writers, ``get_code_identity(refresh=True)``)."""
     global _cached_version_info
     _cached_version_info = None
+    _clear_disk_cache()
+
+
+def _force_live_git() -> bool:
+    """Support/diagnostics: ``version.force_git: true`` in config.yaml prefers live git.
+
+    Intentionally a cheap text probe — ``get_version_info`` sits on the
+    ``hermes --version`` path and must not load the full config stack. No new
+    ``HERMES_*`` env var (behaviour belongs in config.yaml). Only the
+    ``version:`` mapping's ``force_git`` key counts (not a same-named key elsewhere).
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        text = (get_hermes_home() / "config.yaml").read_text(encoding="utf-8-sig")
+    except OSError:
+        return False
+    in_version = False
+    version_indent: int | None = None
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        stripped = raw.strip()
+        if indent == 0 and stripped.startswith("version:"):
+            in_version = True
+            version_indent = 0
+            # Inline map: ``version: {force_git: true}`` — rare; ignore, require nested form.
+            continue
+        if in_version:
+            if version_indent is not None and indent <= version_indent and not stripped.startswith("#"):
+                in_version = False
+                continue
+            key, _, value = stripped.partition(":")
+            if key.strip() == "force_git":
+                return value.split("#", 1)[0].strip().lower() in {"true", "yes", "1"}
+    return False
+
+
+def _read_disk_cache() -> VersionInfo | None:
+    import time
+
+    path = _disk_cache_path()
+    if path is None or not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict) or data.get("schemaVersion") != _DISK_CACHE_SCHEMA:
+        return None
+    cached_at = data.get("cachedAt")
+    if not isinstance(cached_at, (int, float)):
+        return None
+    if time.time() - cached_at > _DISK_CACHE_TTL_SECONDS:
+        return None
+    info = data.get("info")
+    if not isinstance(info, dict):
+        return None
+    source = info.get("source")
+    if source not in {"build", "commit-build", "ci", "docker", "fallback", "git", "local", "nix", "unknown"}:
+        return None
+    return VersionInfo(
+        str(info.get("base_version") or "unknown"),
+        str(info.get("derived_version") or "unknown"),
+        info.get("distance") if isinstance(info.get("distance"), int) else None,
+        info.get("commit") if isinstance(info.get("commit"), str) else None,
+        info.get("branch") if isinstance(info.get("branch"), str) else None,
+        cast(Literal["build", "commit-build", "ci", "docker", "fallback", "git", "local", "nix", "unknown"], source),
+        bool(info.get("dirty")),
+        info.get("commit_date") if isinstance(info.get("commit_date"), int) else None,
+        info.get("distribution") if info.get("distribution") in {"docker", "nix", "desktop-app"} else None,
+    )
+
+
+def _write_disk_cache(info: VersionInfo) -> None:
+    path = _disk_cache_path()
+    if path is None:
+        return
+    import time
+
+    payload = {
+        "schemaVersion": _DISK_CACHE_SCHEMA,
+        "cachedAt": time.time(),
+        "info": {
+            "base_version": info.base_version,
+            "derived_version": info.derived_version,
+            "distance": info.distance,
+            "commit": info.commit,
+            "branch": info.branch,
+            "source": info.source,
+            "dirty": info.dirty,
+            "commit_date": info.commit_date,
+            "distribution": info.distribution,
+        },
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def get_version_info() -> VersionInfo:
-    """Return cached provenance from install stamp, git, or unknown."""
+    """Return cached provenance from install stamp, git, or unknown.
+
+    Resolution order (unless ``version.force_git`` is set for diagnostics):
+    process cache → install stamp → disk TTL cache (git/unknown only) → live git → unknown.
+    Stamp always wins over disk so a re-stamp or rejected ``source=git`` stamp is
+    never masked for up to an hour (YIE-66). Disk memoizes the expensive git path
+    across processes when no usable stamp exists.
+    """
     global _cached_version_info
     if _cached_version_info is not None:
         return _cached_version_info
 
-    # 1. Install stamp (packaged builds: Docker, Nix)
+    force_git = _force_live_git()
+    info: VersionInfo | None = None
+    # 1. Install stamp (packaged builds: Docker, Nix; also re-stamped local branches)
     # A malformed stamp (missing/illegal updateMechanism, mispackaged "light"
     # payload) raises RuntimeError — the build lane that wrote it must be
     # fixed, but a crashing CLI is the wrong failure mode for every uncached
-    # caller. Degrade to "unknown" and let the authoring lane's own tests
+    # caller. Degrade past the stamp and let the authoring lane's own tests
     # surface the malformed stamp.
-    try:
-        info = _stamp_version_info()
-    except RuntimeError:
-        info = None
+    if not force_git:
+        try:
+            info = _stamp_version_info()
+        except RuntimeError:
+            info = None
 
-    # 2. Live git (source/dev installs)
+    # 2. Disk TTL — only when the stamp was absent/rejected; never masks a new stamp.
+    if info is None and not force_git:
+        disk = _read_disk_cache()
+        if disk is not None:
+            _cached_version_info = disk
+            return disk
+
+    # 3. Live git (source/dev installs, or diagnostics via version.force_git)
     if info is None:
         repo_dir = _resolve_repo_dir()
         if repo_dir is not None:
             info = _git_version_info(repo_dir)
 
-    # 3. Unknown — no stamp, no git
+    # 4. Unknown — no stamp, no git
     if info is None:
         info = VersionInfo("unknown", "unknown", None, None, None, "unknown")
 
     _cached_version_info = info
+    # Cache git/unknown resolutions only; stamped identity is already a file on disk.
+    if not force_git and info.source in {"git", "unknown"}:
+        _write_disk_cache(info)
     return info
 
 
@@ -319,9 +464,8 @@ def get_code_identity(refresh: bool = False) -> dict:
     it to re-read identity after swapping the checkout out from under the
     running process.
     """
-    global _cached_version_info
     if refresh:
-        _cached_version_info = None
+        _reset_version_info_cache()
     info = get_version_info()
     return {
         "sha": info.commit,

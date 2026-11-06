@@ -599,6 +599,8 @@ SETUP_SECTIONS = [
 
 def run_setup_wizard(args):
     """Run setup with navigation control scoped to this invocation."""
+    from hermes_cli.config import ensure_provider_profile_env_vars
+    ensure_provider_profile_env_vars()
     with _setup_navigation_scope():
         try:
             return _run_setup_wizard_impl(args)

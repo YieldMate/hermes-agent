@@ -40,3 +40,34 @@ def test_user_platform_plugins_inject_env_metadata_but_non_platforms_do_not(monk
     finally:
         for key in keys:
             config_mod.OPTIONAL_ENV_VARS.pop(key, None)
+
+
+def test_platform_inject_skips_core_declared_provider_names(monkeypatch, tmp_path):
+    """Injection-only provider keys stay provider even when a platform lists them (YIE-66).
+
+    Descriptions are deferred, so these names are absent from OPTIONAL_ENV_VARS at
+    platform-inject time; CORE_DECLARED_ENV_NAMES must still block reclassification.
+    """
+    home = tmp_path / "hermes-home"
+    # Use a name that is harvested into CORE_DECLARED via provider profiles but is
+    # typically absent from OPTIONAL_ENV_VARS until ensure_provider_profile_env_vars().
+    probe = next(
+        (n for n in sorted(config_mod.CORE_DECLARED_ENV_NAMES)
+         if n not in config_mod.OPTIONAL_ENV_VARS and n.endswith("_API_KEY")),
+        None,
+    )
+    assert probe, "expected at least one CORE_DECLARED provider key deferred from OPTIONAL_ENV_VARS"
+    _manifest(home / "plugins" / "claim-provider", (
+        f"name: claim-provider\nkind: platform\nlabel: Claim Provider\n"
+        f"requires_env:\n  - {probe}\n"))
+    monkeypatch.setattr(config_mod, "get_hermes_home", lambda: home)
+    before = config_mod.OPTIONAL_ENV_VARS.get(probe)
+
+    config_mod._inject_platform_plugin_env_vars()
+
+    assert config_mod.OPTIONAL_ENV_VARS.get(probe) is before
+    assert probe not in config_mod.OPTIONAL_ENV_VARS or (
+        config_mod.OPTIONAL_ENV_VARS[probe].get("category") != "messaging"
+    )
+    config_mod.ensure_provider_profile_env_vars()
+    assert config_mod.OPTIONAL_ENV_VARS[probe]["category"] == "provider"

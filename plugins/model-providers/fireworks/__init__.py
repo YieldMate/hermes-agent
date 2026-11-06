@@ -3,9 +3,8 @@
 
 from typing import Any
 
-from hermes_cli.version_info import get_version_info
 from providers import register_provider
-from providers.base import ProviderProfile
+from providers.base import ProviderProfile, versioned_user_agent
 
 
 class FireworksProfile(ProviderProfile):
@@ -32,11 +31,12 @@ fireworks = FireworksProfile(
     signup_url="https://app.fireworks.ai/settings/users/api-keys", env_vars=("FIREWORKS_API_KEY",),
     base_url="https://api.fireworks.ai/inference/v1", auth_type="api_key",
     # Attribution headers (canonical Hermes set); via default_headers so they
-    # survive switch_model and credential rotation.
+    # survive switch_model and credential rotation. User-Agent is version-tokenized
+    # so plugin import never runs get_version_info() (YIE-66).
     default_headers={
         "HTTP-Referer": "https://hermes-agent.nousresearch.com",
         "X-Title": "Hermes Agent",
-        "User-Agent": f"HermesAgent/{get_version_info().base_version}",
+        "User-Agent": versioned_user_agent("HermesAgent"),
     },
     default_aux_model="accounts/fireworks/models/glm-5p2",
     # Picker safety net when the live catalog fetch fails.

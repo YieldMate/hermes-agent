@@ -70,6 +70,9 @@ def provider_catalog() -> list[ProviderDescriptor]:
     from hermes_cli.models_catalog_static import listed_canonical_providers
     PROVIDER_REGISTRY = _safe_import("hermes_cli.auth", "PROVIDER_REGISTRY", {})
     OPTIONAL_ENV_VARS = _safe_import("hermes_cli.config", "OPTIONAL_ENV_VARS", {})
+    ensure = _safe_import("hermes_cli.config", "ensure_provider_profile_env_vars", None)
+    if callable(ensure):
+        ensure()
     # Overlays carry auth_type for providers with no registry/profile entry — notably the ``moa``
     # virtual provider (auth_type "virtual"), which has no credential and no network endpoint.
     HERMES_OVERLAYS = _safe_import("hermes_cli.providers", "HERMES_OVERLAYS", {})

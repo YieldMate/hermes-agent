@@ -277,6 +277,26 @@ def _log_tail(user_data_dir: str) -> str:
     return raw.decode("utf-8", errors="replace").strip()
 
 
+def _optional_install_nonfatal_enabled() -> bool:
+    """Paperclip sets HERMES_OPTIONAL_INSTALL_NONFATAL=0 to roll back YIE-68 degrade messaging."""
+    raw = (os.environ.get("HERMES_OPTIONAL_INSTALL_NONFATAL") or "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _optional_system_lib_hint(tail: str) -> str:
+    """YIE-68: missing host libs (e.g. libXi.so.6) are optional-install failures — degrade, do not fatal the run."""
+    if not _optional_install_nonfatal_enabled():
+        return ""
+    lower = tail.lower()
+    if "libxi" in lower or "cannot open shared object" in lower or "error while loading shared libraries" in lower:
+        return (
+            " Optional system library missing (non-fatal): install distribution Chromium deps "
+            "(e.g. `python -m playwright install-deps chromium` on Debian/Ubuntu) or disable the "
+            "browser toolset; the rest of the run continues without browser."
+        )
+    return ""
+
+
 def _wait_for_devtools(proc: subprocess.Popen, user_data_dir: str, deadline: float) -> tuple[Optional[tuple[int, str]], Optional[str]]:
     while True:
         found = _read_devtools_file(user_data_dir)
@@ -287,6 +307,9 @@ def _wait_for_devtools(proc: subprocess.Popen, user_data_dir: str, deadline: flo
             tail = _log_tail(user_data_dir)
             hint = (" Chromium's sandbox could not start; add --no-sandbox to browser.chromium_args."
                     if "sandbox" in tail.lower() else "")
+            hint += _optional_system_lib_hint(tail)
+            if hint and "Optional system library" in hint:
+                logger.warning("browser: optional install/dependency failed (skip/degrade): %s", tail[:500])
             return None, f"Chromium exited with code {rc} during startup.{hint}" + (f"\n{tail}" if tail else "")
         if time.monotonic() >= deadline:
             return None, "Chromium did not expose a DevTools endpoint in time."

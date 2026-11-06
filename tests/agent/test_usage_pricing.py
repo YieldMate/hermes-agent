@@ -201,6 +201,44 @@ def test_deepseek_deprecated_aliases_price_as_flash():
         ), alias
 
 
+def test_openrouter_deepseek_v32_dated_slug_prices_when_live_catalog_misses(monkeypatch):
+    """YIE-67: Steve's smart-routing cheap model ``deepseek/deepseek-v3.2-20251201`` must
+    still price when OpenRouter /models (or a stale disk cache) only has the short id —
+    or neither. Rates: OpenRouter catalog 2026-11-06 ($0.26 / $0.38 / $0.13 per 1M)."""
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_model_metadata",
+        lambda force_refresh=False: {
+            "deepseek/deepseek-v3.2": {
+                "pricing": {
+                    "prompt": "0.00000026",
+                    "completion": "0.00000038",
+                    "input_cache_read": "0.00000013",
+                }
+            }
+        },
+    )
+    dated = get_pricing_entry(
+        "deepseek/deepseek-v3.2-20251201", provider="openrouter",
+    )
+    assert dated is not None
+    assert dated.input_cost_per_million == Decimal("0.26")
+    assert dated.output_cost_per_million == Decimal("0.38")
+    assert dated.cache_read_cost_per_million == Decimal("0.13")
+
+    monkeypatch.setattr("agent.usage_pricing.fetch_model_metadata", lambda force_refresh=False: {})
+    bundled = get_pricing_entry(
+        "deepseek/deepseek-v3.2-20251201", provider="openrouter",
+    )
+    assert bundled is not None
+    assert bundled.input_cost_per_million == Decimal("0.26")
+    assert bundled.output_cost_per_million == Decimal("0.38")
+    cost = estimate_usage_cost(
+        "deepseek/deepseek-v3.2-20251201",
+        CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=0),
+        provider="openrouter",
+    )
+    assert cost.amount_usd == Decimal("0.64")
+    assert cost.status == "estimated"
 
 
 def test_bedrock_claude_rows_all_carry_cache_pricing():

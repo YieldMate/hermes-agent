@@ -340,3 +340,52 @@ sys.exit(resident.run_resident(idle_sec={idle_sec}))
         os.close(w)
         if proc is not None and proc.poll() is None:
             proc.kill()
+
+
+def test_resident_writes_usage_file_and_clears_pinning_state(tmp_path, monkeypatch):
+    """YIE-70: warm turns must emit HERMES_USAGE_FILE with hot-pinning counters; exit clears cache."""
+    from hermes_cli import resident
+    from hermes_cli import oneshot
+    from tools import hot_tool_pinning
+
+    usage_a = tmp_path / "run-a.usage.json"
+    usage_b = tmp_path / "run-b.usage.json"
+    monkeypatch.setenv("HERMES_HOT_TOOL_PINNING_V1", "1")
+    hot_tool_pinning.clear_hot_pinning_runtime_state()
+
+    class FakeHandle:
+        def __init__(self):
+            self.agent = object()
+
+    calls = {"n": 0}
+
+    def fake_run(handle, prompt, *, ledger=False):
+        calls["n"] += 1
+        hot_tool_pinning.record_tool_call("tool_search")
+        hot_tool_pinning.record_tool_call("terminal")
+        hot_tool_pinning.set_describe_cache("mcp__x__y", '{"description":"d","parameters":{}}')
+        return f"ok-{calls['n']}", {"session_id": "sess", "completed": True, "input_tokens": 3}
+
+    monkeypatch.setattr(oneshot, "open_live_oneshot_agent", lambda **kw: FakeHandle())
+    monkeypatch.setattr(oneshot, "run_live_oneshot_turn", fake_run)
+    monkeypatch.setattr(oneshot, "close_live_oneshot_agent", lambda h: None)
+    monkeypatch.setattr(oneshot, "_normalize_toolsets", lambda v: None)
+
+    lines = [
+        json.dumps({"prompt": "a", "env": {"HERMES_USAGE_FILE": str(usage_a)}}),
+        json.dumps({"prompt": "b", "env": {"HERMES_USAGE_FILE": str(usage_b)}}),
+        json.dumps({"shutdown": True}),
+    ]
+    monkeypatch.setattr(resident.sys, "stdin", io.StringIO("\n".join(lines) + "\n"))
+    monkeypatch.setattr(resident.sys, "stdout", io.StringIO())
+
+    assert resident.run_resident(idle_sec=60) == 0
+
+    report_a = json.loads(usage_a.read_text())
+    report_b = json.loads(usage_b.read_text())
+    assert report_a["tool_search_calls"] == 1
+    assert report_a["tool_calls_total"] == 2
+    # Per-run reset: second turn must not accumulate the first turn's counts.
+    assert report_b["tool_search_calls"] == 1
+    assert report_b["tool_calls_total"] == 2
+    assert hot_tool_pinning.describe_cache_size() == 0

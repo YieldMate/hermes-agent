@@ -86,6 +86,18 @@ def _write_disposition_from_result(result: dict, response: str) -> Optional[dict
     return None
 
 
+def _write_resident_usage(result: dict, failure: Optional[str] = None) -> None:
+    """Mirror oneshot ``--usage-file`` so Paperclip can merge YIE-70 telemetry on warm turns."""
+    path = (os.getenv("HERMES_USAGE_FILE") or "").strip()
+    if not path:
+        return
+    try:
+        from hermes_cli.oneshot import _write_usage_file
+        _write_usage_file(path, result if isinstance(result, dict) else {}, failure=failure)
+    except Exception:
+        logger.debug("resident: usage file write failed", exc_info=True)
+
+
 def _fingerprint(model, provider, toolsets) -> tuple:
     return (model or None, provider or None, toolsets if toolsets is not None else None)
 
@@ -213,6 +225,13 @@ def run_resident(
             turn_toolsets = turn.get("toolsets") if turn.get("toolsets") is not None else agent_toolsets
             turn_resume = turn.get("session_id") if isinstance(turn.get("session_id"), str) else session_id
             turn_fp = _fingerprint(turn_model, turn_provider, turn_toolsets)
+            # Each Paperclip run owns its own HERMES_USAGE_FILE; reset per-turn so counters
+            # are run-scoped, not cumulative across the warm resident's lifetime (YIE-70).
+            try:
+                from tools.hot_tool_pinning import reset_hot_pinning_telemetry
+                reset_hot_pinning_telemetry()
+            except Exception:
+                pass
 
             try:
                 if handle is None or handle_fp != turn_fp:
@@ -246,9 +265,11 @@ def run_resident(
                         if isinstance(result, dict)
                     },
                 })
+                _write_resident_usage(result if isinstance(result, dict) else {})
             except Exception as exc:
                 logger.exception("resident turn failed")
                 _write_result({"ok": False, "error": str(exc), "session_id": session_id})
+                _write_resident_usage({}, failure=str(exc))
                 # Drop a broken agent so the next turn rebuilds cleanly.
                 if handle is not None:
                     close_live_oneshot_agent(handle)
@@ -265,6 +286,12 @@ def run_resident(
             agent_provider = turn_provider or agent_provider
     finally:
         close_live_oneshot_agent(handle)
+        # Describe cache + pin override live for the warm resident's lifetime; clear on exit.
+        try:
+            from tools.hot_tool_pinning import clear_hot_pinning_runtime_state
+            clear_hot_pinning_runtime_state()
+        except Exception:
+            pass
 
 
 def cmd_resident_from_args(args) -> None:

@@ -350,30 +350,67 @@ def test_resident_writes_usage_file_and_clears_pinning_state(tmp_path, monkeypat
 
     usage_a = tmp_path / "run-a.usage.json"
     usage_b = tmp_path / "run-b.usage.json"
+    # Spawn env residual must not survive: flag is delivered per turn.env (Paperclip contract).
     monkeypatch.setenv("HERMES_HOT_TOOL_PINNING_V1", "1")
     hot_tool_pinning.clear_hot_pinning_runtime_state()
 
+    class FakeAgent:
+        def __init__(self):
+            self.session_input_tokens = 0
+            self.session_output_tokens = 0
+            self.session_total_tokens = 0
+            self.session_estimated_cost_usd = 0.0
+
     class FakeHandle:
         def __init__(self):
-            self.agent = object()
+            self.agent = FakeAgent()
 
     calls = {"n": 0}
+    flag_during_turn = []
 
     def fake_run(handle, prompt, *, ledger=False):
         calls["n"] += 1
+        flag_during_turn.append(hot_tool_pinning.is_hot_tool_pinning_v1_enabled())
+        # Session counters are cumulative across the warm resident; usage file must be deltas.
+        handle.agent.session_input_tokens = 3 if calls["n"] == 1 else 7
+        handle.agent.session_total_tokens = handle.agent.session_input_tokens
+        handle.agent.session_estimated_cost_usd = 0.01 * handle.agent.session_input_tokens
         hot_tool_pinning.record_tool_call("tool_search")
         hot_tool_pinning.record_tool_call("terminal")
         hot_tool_pinning.set_describe_cache("mcp__x__y", '{"description":"d","parameters":{}}')
-        return f"ok-{calls['n']}", {"session_id": "sess", "completed": True, "input_tokens": 3}
+        return (
+            f"ok-{calls['n']}",
+            {
+                "session_id": "sess",
+                "completed": True,
+                "input_tokens": handle.agent.session_input_tokens,
+                "total_tokens": handle.agent.session_total_tokens,
+                "estimated_cost_usd": handle.agent.session_estimated_cost_usd,
+            },
+        )
 
     monkeypatch.setattr(oneshot, "open_live_oneshot_agent", lambda **kw: FakeHandle())
     monkeypatch.setattr(oneshot, "run_live_oneshot_turn", fake_run)
     monkeypatch.setattr(oneshot, "close_live_oneshot_agent", lambda h: None)
     monkeypatch.setattr(oneshot, "_normalize_toolsets", lambda v: None)
 
+    pin_env_on = {
+        "HERMES_HOT_TOOL_PINNING_V1": "1",
+        "PAPERCLIP_HOT_TOOL_PINNING_V1": "1",
+    }
     lines = [
-        json.dumps({"prompt": "a", "env": {"HERMES_USAGE_FILE": str(usage_a)}}),
-        json.dumps({"prompt": "b", "env": {"HERMES_USAGE_FILE": str(usage_b)}}),
+        json.dumps({"prompt": "a", "env": {**pin_env_on, "HERMES_USAGE_FILE": str(usage_a)}}),
+        json.dumps({"prompt": "b", "env": {**pin_env_on, "HERMES_USAGE_FILE": str(usage_b)}}),
+        # Flag-off follow-up: explicit nulls (and omitted keys) must leave the flag off mid-turn.
+        json.dumps({
+            "prompt": "c",
+            "env": {
+                "HERMES_HOT_TOOL_PINNING_V1": None,
+                "PAPERCLIP_HOT_TOOL_PINNING_V1": None,
+                "HERMES_PINNED_TOOLS_FILE": None,
+                "HERMES_PINNED_TOOLS": None,
+            },
+        }),
         json.dumps({"shutdown": True}),
     ]
     monkeypatch.setattr(resident.sys, "stdin", io.StringIO("\n".join(lines) + "\n"))
@@ -385,7 +422,11 @@ def test_resident_writes_usage_file_and_clears_pinning_state(tmp_path, monkeypat
     report_b = json.loads(usage_b.read_text())
     assert report_a["tool_search_calls"] == 1
     assert report_a["tool_calls_total"] == 2
+    assert report_a["input_tokens"] == 3
     # Per-run reset: second turn must not accumulate the first turn's counts.
     assert report_b["tool_search_calls"] == 1
     assert report_b["tool_calls_total"] == 2
+    assert report_b["input_tokens"] == 4  # 7 - 3 cumulative delta
+    assert flag_during_turn == [True, True, False]
     assert hot_tool_pinning.describe_cache_size() == 0
+    assert not hot_tool_pinning.is_hot_tool_pinning_v1_enabled()

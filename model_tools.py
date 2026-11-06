@@ -271,11 +271,16 @@ def _tool_defs_cache_key(
         cfg_fp = file_signature(cfg_stat)
     except (FileNotFoundError, OSError, ImportError):
         cfg_fp = None
+    try:
+        from tools.hot_tool_pinning import pin_cache_fingerprint
+        hot_pin_fp = pin_cache_fingerprint()
+    except Exception:
+        hot_pin_fp = None
     return (
         registry.current_scope_key(), frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
         frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
         bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
-        _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope,
+        _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope, hot_pin_fp,
     )
 
 
@@ -906,8 +911,7 @@ def handle_function_call(
             return _emit(result, duration_ms=_elapsed_ms(start))
         from tools.connectors import CONNECTOR_BATCH_SENTINEL, dispatch_connector_batch
         if underlying[0] == CONNECTOR_BATCH_SENTINEL:
-            for entry in underlying[1]["calls"]:
-                hot_tool_pinning.record_tool_call(entry["name"])
+            # Nested handle_function_call per entry records tool_calls_total; do not double-count here.
             return _emit(dispatch_connector_batch(
                 underlying[1]["calls"], ids, user_task=user_task,
                 enabled_tools=enabled_tools, middleware_trace=trace,

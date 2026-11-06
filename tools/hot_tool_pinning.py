@@ -150,11 +150,37 @@ def is_pinned_tool(name: str) -> bool:
     return name in pinned_tool_names()
 
 
+def pin_cache_fingerprint() -> tuple:
+    """Memo key fragment for tool-definition caches: flag + frozen/resolved pin set."""
+    if not is_hot_tool_pinning_v1_enabled():
+        return (False, frozenset(), 0)
+    names, tokens = _resolve_pinned()
+    return (True, names, tokens)
+
+
 def set_pinned_override(names: Optional[Iterable[str]]) -> None:
     """Pin an explicit set (hosts that resolve pins themselves); ``None`` restores manifest loading."""
     global _pinned_override
     with _lock:
         _pinned_override = None if names is None else frozenset(names)
+
+
+def freeze_pins_from_env() -> frozenset[str]:
+    """Resolve the pin set once from env/manifest and lock it for the session (prompt-cache safe).
+
+    Long-lived processes (resident) must not re-read a changing ``HERMES_PINNED_TOOLS_FILE`` mid-session:
+    dispatch gates and ``agent.tools`` would otherwise disagree. Call again only when rebuilding the agent.
+    """
+    global _pinned_override, _pinned_cache
+    with _lock:
+        _pinned_override = None
+        _pinned_cache = None
+    if not is_hot_tool_pinning_v1_enabled():
+        release_if_disabled()
+        return frozenset()
+    names = pinned_tool_names()
+    set_pinned_override(names)
+    return names
 
 
 # --- tool_describe cache ----------------------------------------------------------------------
@@ -286,9 +312,10 @@ def release_if_disabled() -> None:
 
 __all__ = [
     "HOT_PINNING_MCP_RESULT_SIZE_CHARS", "MAX_PINNED_SCHEMA_TOKENS", "MAX_PINNED_TOOLS", "SEARCH_RESULT_CAP",
-    "clear_describe_cache", "clear_hot_pinning_runtime_state", "describe_cache_size", "get_describe_cache",
-    "is_hot_tool_pinning_v1_enabled", "is_pinned_tool", "merge_ranked_names", "pinned_schema_tokens",
-    "pinned_tool_names", "record_tool_call", "release_if_disabled", "render_describe_result",
-    "reset_hot_pinning_telemetry", "select_pinned_entries", "set_describe_cache", "set_pinned_override",
-    "snapshot_hot_pinning_telemetry", "tool_calls_total", "tool_describe_calls", "tool_search_calls",
+    "clear_describe_cache", "clear_hot_pinning_runtime_state", "describe_cache_size", "freeze_pins_from_env",
+    "get_describe_cache", "is_hot_tool_pinning_v1_enabled", "is_pinned_tool", "merge_ranked_names",
+    "pin_cache_fingerprint", "pinned_schema_tokens", "pinned_tool_names", "record_tool_call",
+    "release_if_disabled", "render_describe_result", "reset_hot_pinning_telemetry", "select_pinned_entries",
+    "set_describe_cache", "set_pinned_override", "snapshot_hot_pinning_telemetry", "tool_calls_total",
+    "tool_describe_calls", "tool_search_calls",
 ]

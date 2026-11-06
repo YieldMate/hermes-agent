@@ -86,16 +86,62 @@ def _write_disposition_from_result(result: dict, response: str) -> Optional[dict
     return None
 
 
+_PIN_ENV_KEYS = (
+    "PAPERCLIP_HOT_TOOL_PINNING_V1",
+    "HERMES_HOT_TOOL_PINNING_V1",
+    "HERMES_PINNED_TOOLS_FILE",
+    "HERMES_PINNED_TOOLS",
+)
+
+_SESSION_USAGE_ATTRS = (
+    ("input_tokens", "session_input_tokens"),
+    ("output_tokens", "session_output_tokens"),
+    ("total_tokens", "session_total_tokens"),
+    ("estimated_cost_usd", "session_estimated_cost_usd"),
+    ("cache_read_tokens", "session_cache_read_tokens"),
+    ("cache_write_tokens", "session_cache_write_tokens"),
+    ("reasoning_tokens", "session_reasoning_tokens"),
+)
+
+
+def _clear_pin_env() -> dict[str, Optional[str]]:
+    """Pop pinning vars so a flag-off turn cannot inherit spawn-env residual state."""
+    prior: dict[str, Optional[str]] = {}
+    for key in _PIN_ENV_KEYS:
+        prior[key] = os.environ.get(key)
+        os.environ.pop(key, None)
+    return prior
+
+
+def _session_usage_snapshot(agent: object) -> dict[str, float]:
+    snap: dict[str, float] = {}
+    for out_key, attr in _SESSION_USAGE_ATTRS:
+        val = getattr(agent, attr, None)
+        if isinstance(val, (int, float)):
+            snap[out_key] = float(val)
+    return snap
+
+
+def _delta_usage(before: dict[str, float], result: dict) -> dict:
+    """Convert session-cumulative token/cost fields into per-turn deltas for Paperclip billing."""
+    out = dict(result) if isinstance(result, dict) else {}
+    for key, prior in before.items():
+        after = out.get(key)
+        if isinstance(after, (int, float)):
+            delta = after - prior
+            out[key] = int(delta) if key != "estimated_cost_usd" and float(delta).is_integer() else max(0.0, delta)
+            if out[key] < 0:
+                out[key] = 0 if key != "estimated_cost_usd" else 0.0
+    return out
+
+
 def _write_resident_usage(result: dict, failure: Optional[str] = None) -> None:
     """Mirror oneshot ``--usage-file`` so Paperclip can merge YIE-70 telemetry on warm turns."""
     path = (os.getenv("HERMES_USAGE_FILE") or "").strip()
     if not path:
         return
-    try:
-        from hermes_cli.oneshot import _write_usage_file
-        _write_usage_file(path, result if isinstance(result, dict) else {}, failure=failure)
-    except Exception:
-        logger.debug("resident: usage file write failed", exc_info=True)
+    from hermes_cli.oneshot import _write_usage_file
+    _write_usage_file(path, result if isinstance(result, dict) else {}, failure=failure)
 
 
 def _fingerprint(model, provider, toolsets) -> tuple:
@@ -219,25 +265,34 @@ def run_resident(
             elif "mcp_overlay" in turn:
                 os.environ.pop("HERMES_MCP_OVERLAY", None)
 
+            # Pinning is turn-scoped: clear spawn residuals first, then apply turn.env
+            # (explicit nulls from Paperclip pop keys for flag-off rollback).
+            _clear_pin_env()
             prior = _apply_turn_env(turn.get("env"))
             turn_model = turn.get("model") if isinstance(turn.get("model"), str) else agent_model
             turn_provider = turn.get("provider") if isinstance(turn.get("provider"), str) else agent_provider
             turn_toolsets = turn.get("toolsets") if turn.get("toolsets") is not None else agent_toolsets
             turn_resume = turn.get("session_id") if isinstance(turn.get("session_id"), str) else session_id
             turn_fp = _fingerprint(turn_model, turn_provider, turn_toolsets)
+            from tools.hot_tool_pinning import (
+                freeze_pins_from_env,
+                release_if_disabled,
+                reset_hot_pinning_telemetry,
+            )
             # Each Paperclip run owns its own HERMES_USAGE_FILE; reset per-turn so counters
             # are run-scoped, not cumulative across the warm resident's lifetime (YIE-70).
-            try:
-                from tools.hot_tool_pinning import reset_hot_pinning_telemetry
-                reset_hot_pinning_telemetry()
-            except Exception:
-                pass
+            reset_hot_pinning_telemetry()
+            release_if_disabled()
+            usage_file_set = bool((os.getenv("HERMES_USAGE_FILE") or "").strip())
+            before_usage: dict[str, float] = {}
 
             try:
                 if handle is None or handle_fp != turn_fp:
                     if handle is not None:
                         close_live_oneshot_agent(handle)
                         handle = None
+                    # Freeze pins at agent build so dispatch gates match the tool surface.
+                    freeze_pins_from_env()
                     handle = open_live_oneshot_agent(
                         model=turn_model,
                         provider=turn_provider,
@@ -246,8 +301,17 @@ def run_resident(
                         resume=turn_resume,
                     )
                     handle_fp = turn_fp
+                else:
+                    # Keep the frozen pin set; still clear residual state when the flag flips off.
+                    release_if_disabled()
 
-                response, result = run_live_oneshot_turn(handle, prompt)
+                before_usage = _session_usage_snapshot(getattr(handle, "agent", None) or object())
+                response, result = run_live_oneshot_turn(
+                    handle, prompt, ledger=usage_file_set,
+                )
+                usage_payload = _delta_usage(
+                    before_usage, result if isinstance(result, dict) else {},
+                )
                 if isinstance(result, dict) and result.get("session_id"):
                     session_id = result["session_id"]
                 disposition = _write_disposition_from_result(
@@ -265,11 +329,17 @@ def run_resident(
                         if isinstance(result, dict)
                     },
                 })
-                _write_resident_usage(result if isinstance(result, dict) else {})
+                _write_resident_usage(usage_payload)
             except Exception as exc:
                 logger.exception("resident turn failed")
+                failure_usage = {}
+                if handle is not None:
+                    failure_usage = _delta_usage(
+                        before_usage,
+                        _session_usage_snapshot(getattr(handle, "agent", None) or object()),
+                    )
                 _write_result({"ok": False, "error": str(exc), "session_id": session_id})
-                _write_resident_usage({}, failure=str(exc))
+                _write_resident_usage(failure_usage, failure=str(exc))
                 # Drop a broken agent so the next turn rebuilds cleanly.
                 if handle is not None:
                     close_live_oneshot_agent(handle)
@@ -277,8 +347,11 @@ def run_resident(
                     handle_fp = None
             finally:
                 _restore_env(prior)
-                # Drop the run-scoped API key between turns.
+                # Drop the run-scoped API key between turns. Never restore pin_prior (spawn
+                # residuals); leave pin keys cleared until the next turn.env re-applies them.
                 os.environ.pop("PAPERCLIP_API_KEY", None)
+                for key in _PIN_ENV_KEYS:
+                    os.environ.pop(key, None)
 
             # Idle counts from the last *completed* turn (success or failure).
             last_activity = time.monotonic()
@@ -287,11 +360,8 @@ def run_resident(
     finally:
         close_live_oneshot_agent(handle)
         # Describe cache + pin override live for the warm resident's lifetime; clear on exit.
-        try:
-            from tools.hot_tool_pinning import clear_hot_pinning_runtime_state
-            clear_hot_pinning_runtime_state()
-        except Exception:
-            pass
+        from tools.hot_tool_pinning import clear_hot_pinning_runtime_state
+        clear_hot_pinning_runtime_state()
 
 
 def cmd_resident_from_args(args) -> None:

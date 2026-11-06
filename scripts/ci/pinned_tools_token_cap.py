@@ -13,7 +13,8 @@ cl100k_base count on the OpenAI wire shape as ``hermes_cli.tools_config.estimate
 
 Without a path argument it searches ``overlays/`` under the current directory and under
 ``$HERMES_HOME``. Exit codes: 0 = every agent fits (or nothing found), 1 = at least one agent over
-the cap, 2 = unreadable manifest or missing tiktoken under ``--require-tiktoken``.
+the cap / over the tool count / missing schemas under ``--require-tiktoken``, 2 = unreadable
+manifest or missing tiktoken under ``--require-tiktoken``.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.hot_tool_pinning import MAX_PINNED_SCHEMA_TOKENS
+from tools.hot_tool_pinning import MAX_PINNED_SCHEMA_TOKENS, MAX_PINNED_TOOLS
 
 MANIFEST_NAME = "pinned-tools.json"
 
@@ -39,10 +40,15 @@ class AgentBudget:
     tokens: int
     per_tool: dict[str, int]
     unsized: tuple[str, ...]
+    tool_count: int
 
     @property
     def over_cap(self) -> bool:
         return self.tokens > MAX_PINNED_SCHEMA_TOKENS
+
+    @property
+    def over_tool_cap(self) -> bool:
+        return self.tool_count > MAX_PINNED_TOOLS
 
 
 def find_manifests(paths: list[str]) -> list[Path]:
@@ -78,16 +84,20 @@ def measure_manifest(manifest: Path) -> AgentBudget:
         raise ValueError(f"{manifest}: expected a tools list")
     per_tool: dict[str, int] = {}
     unsized: list[str] = []
+    tool_count = 0
     for item in items:
         entry = {"name": item} if isinstance(item, str) else item
         if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
             raise ValueError(f"{manifest}: tool entries need a string name")
+        tool_count += 1
         schema = _function_schema(entry)
         if schema is None:
             unsized.append(entry["name"])
         else:
             per_tool[entry["name"]] = estimate_schema_tokens(schema)
-    return AgentBudget(manifest, manifest.parent.name, sum(per_tool.values()), per_tool, tuple(unsized))
+    return AgentBudget(
+        manifest, manifest.parent.name, sum(per_tool.values()), per_tool, tuple(unsized), tool_count,
+    )
 
 
 def check_manifests(paths: list[str]) -> list[AgentBudget]:
@@ -118,14 +128,32 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     failed = False
     for budget in budgets:
-        status = "OVER CAP" if budget.over_cap else "ok"
-        print(f"{status}: {budget.agent} ({budget.manifest}) {budget.tokens}/{MAX_PINNED_SCHEMA_TOKENS} tokens")
+        status = "OVER CAP" if budget.over_cap or budget.over_tool_cap or (
+            args.require_tiktoken and budget.unsized
+        ) else "ok"
+        print(
+            f"{status}: {budget.agent} ({budget.manifest}) "
+            f"{budget.tokens}/{MAX_PINNED_SCHEMA_TOKENS} tokens, "
+            f"{budget.tool_count}/{MAX_PINNED_TOOLS} tools"
+        )
         if budget.over_cap:
             failed = True
             for name, tokens in sorted(budget.per_tool.items(), key=lambda kv: -kv[1]):
                 print(f"    {tokens:>6}  {name}")
-        for name in budget.unsized:
-            print(f"    note: {name} has no schema in the manifest and was not counted", file=sys.stderr)
+        if budget.over_tool_cap:
+            failed = True
+            print(
+                f"    error: {budget.tool_count} tools exceed the cap of {MAX_PINNED_TOOLS}",
+                file=sys.stderr,
+            )
+        if budget.unsized:
+            stream = sys.stderr
+            for name in budget.unsized:
+                if args.require_tiktoken:
+                    failed = True
+                    print(f"    error: {name} has no schema in the manifest", file=stream)
+                else:
+                    print(f"    note: {name} has no schema in the manifest and was not counted", file=stream)
     return 1 if failed else 0
 
 

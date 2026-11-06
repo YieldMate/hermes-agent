@@ -3,12 +3,16 @@ name: Pinned Tools Token Cap
 # Job `pinned-tools-token-cap`: every overlays/**/pinned-tools.json manifest must keep its pinned
 # MCP tool schemas under 10,000 cl100k_base tokens (hot tool pinning v1, YIE-70).
 #
-# Runs on every pull request, not only when a manifest changes: the cap also depends on
-# scripts/ci/pinned_tools_token_cap.py and the token estimator, and the check is a few seconds
-# of plain Python. With no overlays/ directory it passes.
+# Runs on every pull request, push to the feature branch, and workflow_dispatch so the check is
+# runnable without opening a PR. With no overlays/ directory it passes.
 
 on:
   pull_request:
+  push:
+    branches:
+      - "cursor/yie-70-hot-mcp-pinning-c24b"
+      - "cursor/**-c24b"
+  workflow_dispatch:
   workflow_call:
     inputs:
       commit:

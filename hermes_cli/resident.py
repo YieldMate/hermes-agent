@@ -14,13 +14,18 @@ Stdout: one JSON object per line::
     {"ok": true, "response": "...", "session_id": "...", "disposition": {...}}
 
 Idle timeout (default 900s) or a ``{"shutdown": true}`` line exits cleanly.
+Idle is measured from the last *completed* turn and is checked with
+``select.select`` while waiting on stdin so a held-open silent pipe still
+exits (Paperclip adapters pass ``--resident-idle-sec 86400``).
 """
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
+import select
 import sys
 import time
 from typing import Any, Optional
@@ -85,6 +90,52 @@ def _fingerprint(model, provider, toolsets) -> tuple:
     return (model or None, provider or None, toolsets if toolsets is not None else None)
 
 
+def _stdin_readable(timeout: float) -> bool:
+    """True when stdin has data/EOF ready within timeout; False on idle wait expiry.
+
+    Stdin is a pipe under Paperclip, so select is safe. Non-selectable test
+    doubles (StringIO) fall through to "ready" and let readline drive EOF.
+    """
+    if timeout < 0:
+        return False
+    try:
+        fileno = sys.stdin.fileno()
+    except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
+        # Tests inject StringIO; treat as ready so readline returns immediately.
+        return True
+    try:
+        ready, _, _ = select.select([fileno], [], [], max(timeout, 0.0))
+        return bool(ready)
+    except (OSError, ValueError):
+        return True
+
+
+def _wait_for_turn_line(idle_sec: float, last_activity: float) -> tuple[Optional[str], Optional[str]]:
+    """Block until a stdin line, EOF, or strict idle (> idle_sec since last_activity).
+
+    Returns ``(line, None)`` for data (including blank lines), ``("", None)`` is
+    not used — EOF is ``(None, "eof")``, idle is ``(None, "idle")``.
+    Boundary: idle fires only when elapsed is *strictly greater* than idle_sec
+    (remaining < 0). Exactly idle_sec keeps waiting.
+    """
+    while True:
+        remaining = idle_sec - (time.monotonic() - last_activity)
+        # Strictly greater than idle_sec → remaining < 0.
+        if remaining < 0:
+            return None, "idle"
+        if not _stdin_readable(remaining):
+            # select timed out; re-check the clock (exactly idle_sec stays alive).
+            # Yield so a zero-timeout poll cannot peg the CPU until wall time
+            # tips remaining below zero.
+            if remaining == 0:
+                time.sleep(0.001)
+            continue
+        line = sys.stdin.readline()
+        if line == "":
+            return None, "eof"
+        return line, None
+
+
 def run_resident(
     *,
     idle_sec: float = _DEFAULT_IDLE_SEC,
@@ -120,17 +171,14 @@ def run_resident(
 
     try:
         while True:
-            remaining = idle_sec - (time.monotonic() - last_activity)
-            if remaining <= 0:
+            line, reason = _wait_for_turn_line(idle_sec, last_activity)
+            if reason == "idle":
                 _write_result({"ok": True, "shutdown": "idle"})
                 return 0
-
-            # Blocking readline; Paperclip holds the process and writes the next turn.
-            # Idle is checked between turns, not mid-read (select would need nonblock tty).
-            line = sys.stdin.readline()
-            if line == "":
+            if reason == "eof":
                 _write_result({"ok": True, "shutdown": "eof"})
                 return 0
+            assert line is not None
             line = line.strip()
             if not line:
                 continue
@@ -211,6 +259,7 @@ def run_resident(
                 # Drop the run-scoped API key between turns.
                 os.environ.pop("PAPERCLIP_API_KEY", None)
 
+            # Idle counts from the last *completed* turn (success or failure).
             last_activity = time.monotonic()
             agent_model = turn_model or agent_model
             agent_provider = turn_provider or agent_provider

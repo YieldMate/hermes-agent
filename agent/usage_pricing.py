@@ -511,12 +511,71 @@ def _anthropic_fast_mode_entry(model: str) -> Optional[PricingEntry]:
         _normalize_anthropic_model_name(name))
 
 
-def _openrouter_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
-    return _pricing_entry_from_metadata(
-        fetch_model_metadata(), route.model,
-        source_url="https://openrouter.ai/docs/api/api-reference/models/get-models",
-        pricing_version="openrouter-models-api",
+# OpenRouter catalog snapshot for ids the live /models response may omit from a
+# stale disk cache (dated canonical slug vs short public id). Rates verified
+# against https://openrouter.ai/api/v1/models on 2026-11-06:
+# deepseek/deepseek-v3.2 → prompt $0.26 / completion $0.38 / cache_read $0.13 per 1M
+# (canonical_slug deepseek/deepseek-v3.2-20251201).
+_OPENROUTER_URL = "https://openrouter.ai/deepseek/deepseek-v3.2"
+_OPENROUTER_BUNDLED_PRICING: dict[str, PricingEntry] = {}
+for _openrouter_id in (
+    "deepseek/deepseek-v3.2",
+    "deepseek/deepseek-v3.2-20251201",
+    "deepseek-v3.2",
+    "deepseek-v3.2-20251201",
+):
+    _OPENROUTER_BUNDLED_PRICING[_openrouter_id] = _snap(
+        "0.26", "0.38", "0.13",
+        version="openrouter-catalog-2026-11-06",
+        url=_OPENROUTER_URL,
     )
+del _openrouter_id, _OPENROUTER_URL
+
+
+def _openrouter_lookup_ids(model_id: str) -> list[str]:
+    """Ids to try for OpenRouter pricing: exact, dated-suffix stripped, bare name."""
+    model = (model_id or "").strip()
+    if not model:
+        return []
+    ids = [model]
+    # OpenRouter canonical dates: ``deepseek/deepseek-v3.2-20251201`` → ``deepseek/deepseek-v3.2``.
+    undated = re.sub(r"-\d{8}$", "", model)
+    if undated != model:
+        ids.append(undated)
+    if "/" in model:
+        bare = model.split("/", 1)[1]
+        ids.append(bare)
+        undated_bare = re.sub(r"-\d{8}$", "", bare)
+        if undated_bare != bare:
+            ids.append(undated_bare)
+    # De-dupe while preserving order.
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in ids:
+        key = item.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(item)
+    return out
+
+
+def _openrouter_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
+    metadata = fetch_model_metadata()
+    source_url = "https://openrouter.ai/docs/api/api-reference/models/get-models"
+    for model_id in _openrouter_lookup_ids(route.model):
+        entry = _pricing_entry_from_metadata(
+            metadata, model_id,
+            source_url=source_url,
+            pricing_version="openrouter-models-api",
+        )
+        if entry:
+            return entry
+    # Bundled snapshot when live /models (or a stale disk cache) misses the id.
+    for model_id in _openrouter_lookup_ids(route.model):
+        bundled = _OPENROUTER_BUNDLED_PRICING.get(model_id) or _OPENROUTER_BUNDLED_PRICING.get(model_id.lower())
+        if bundled:
+            return bundled
+    return None
 
 
 def _pricing_entry_from_metadata(

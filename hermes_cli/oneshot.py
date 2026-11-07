@@ -228,12 +228,20 @@ def _validate_explicit_toolsets(toolsets: object = None) -> tuple[list[str] | No
     unknown = [name for name in unresolved if name not in mcp_names and name not in mcp_disabled]
     valid = built_in + mcp_valid
 
-    if unknown:
-        sys.stderr.write(f"hermes -z: ignoring unknown --toolsets entries: {', '.join(unknown)}\n")
     if disabled:
         sys.stderr.write(
             "hermes -z: ignoring disabled MCP servers (set enabled: true in config.yaml to use): "
             f"{', '.join(disabled)}\n"
+        )
+    # YIE-68: fail fast when any -t entry does not resolve. Ignoring unknowns previously
+    # let Paperclip Atlas wake with creative/productivity and still burn a cold start before
+    # exit-2; a clear config error naming the unresolved toolsets is cheaper.
+    if unknown:
+        return (
+            None,
+            "hermes -z: toolset(s) not found/resolved/valid: "
+            f"{', '.join(unknown)}. Fix --toolsets / -t (remove unknown names) "
+            "or install the matching toolset.\n",
         )
     if not valid:
         return None, "hermes -z: --toolsets did not contain any valid toolsets.\n"

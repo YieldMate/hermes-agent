@@ -631,6 +631,25 @@ def _models_dev_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
     )
 
 
+def _endpoint_models_pricing_entry(
+    route: BillingRoute, *, api_key: str,
+) -> Optional[PricingEntry]:
+    """Live ``/models`` lookup with dated-id / bare-name fallbacks (Nous, etc.)."""
+    if not route.base_url:
+        return None
+    metadata = fetch_endpoint_model_metadata(route.base_url, api_key=api_key)
+    source_url = f"{route.base_url.rstrip('/')}/models"
+    for model_id in _openrouter_lookup_ids(route.model):
+        entry = _pricing_entry_from_metadata(
+            metadata, model_id,
+            source_url=source_url,
+            pricing_version="openai-compatible-models-api",
+        )
+        if entry:
+            return entry
+    return None
+
+
 def get_pricing_entry(
     model_name: str, provider: Optional[str] = None, base_url: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -644,14 +663,23 @@ def get_pricing_entry(
     bundled_entry = _lookup_official_docs_pricing(route)
     if bundled_entry:
         return bundled_entry
-    if route.base_url:
-        entry = _pricing_entry_from_metadata(
-            fetch_endpoint_model_metadata(route.base_url, api_key=api_key or ""), route.model,
-            source_url=f"{route.base_url.rstrip('/')}/models",
-            pricing_version="openai-compatible-models-api",
+    endpoint_entry = _endpoint_models_pricing_entry(route, api_key=api_key or "")
+    if endpoint_entry:
+        return endpoint_entry
+    # Nous (and other official_models_api hosts) may expose dated DeepSeek ids
+    # that the live /models list omits. Reuse OpenRouter live + bundled rates
+    # (including cache) so traffic is estimated instead of cost_status=unknown.
+    if route.billing_mode == "official_models_api":
+        openrouter_fallback = _openrouter_pricing_entry(
+            BillingRoute(
+                provider="openrouter",
+                model=route.model,
+                base_url="",
+                billing_mode="official_models_api",
+            ),
         )
-        if entry:
-            return entry
+        if openrouter_fallback:
+            return openrouter_fallback
     return _models_dev_pricing_entry(route)
 
 

@@ -241,6 +241,57 @@ def test_openrouter_deepseek_v32_dated_slug_prices_when_live_catalog_misses(monk
     assert cost.status == "estimated"
 
 
+def test_nous_deepseek_v32_dated_slug_falls_back_to_openrouter_bundled(monkeypatch):
+    """Nous /models often omits dated DeepSeek ids; fall back to OpenRouter bundled rates."""
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        lambda base_url, api_key="": {},
+    )
+    monkeypatch.setattr("agent.usage_pricing.fetch_model_metadata", lambda force_refresh=False: {})
+    dated = get_pricing_entry(
+        "deepseek/deepseek-v3.2-20251201",
+        provider="nous",
+        base_url="https://inference-api.nousresearch.com/v1",
+    )
+    assert dated is not None
+    assert dated.input_cost_per_million == Decimal("0.26")
+    assert dated.output_cost_per_million == Decimal("0.38")
+    assert dated.cache_read_cost_per_million == Decimal("0.13")
+    cost = estimate_usage_cost(
+        "deepseek/deepseek-v3.2-20251201",
+        CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=500_000),
+        provider="nous",
+        base_url="https://inference-api.nousresearch.com/v1",
+    )
+    # 0.26 + 0.38 + 0.5 * 0.13 = 0.705
+    assert cost.amount_usd == Decimal("0.705")
+    assert cost.status == "estimated"
+
+
+def test_nous_deepseek_v32_dated_slug_uses_endpoint_undated_id(monkeypatch):
+    """When Nous /models has the undated slug, strip the date and use those rates."""
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        lambda base_url, api_key="": {
+            "deepseek/deepseek-v3.2": {
+                "pricing": {
+                    "prompt": "0.00000026",
+                    "completion": "0.00000038",
+                    "input_cache_read": "0.00000013",
+                }
+            }
+        },
+    )
+    entry = get_pricing_entry(
+        "deepseek/deepseek-v3.2-20251201",
+        provider="nous",
+        base_url="https://inference-api.nousresearch.com/v1",
+    )
+    assert entry is not None
+    assert entry.input_cost_per_million == Decimal("0.26")
+    assert entry.pricing_version == "openai-compatible-models-api"
+
+
 def test_bedrock_claude_rows_all_carry_cache_pricing():
     """Invariant: every Bedrock Claude pricing row must carry cache-read AND
     cache-write rates, otherwise a cached session prices as ``unknown``.

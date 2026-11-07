@@ -948,6 +948,8 @@ tool_budget:
 
 The MCP threshold is always capped at the (possibly context-scaled) generic per-result threshold, so raising it cannot exceed what the active model's window allows.
 
+**Hot MCP tool pinning (v1, opt-in).** Setting `HERMES_HOT_TOOL_PINNING_V1=1` (`PAPERCLIP_HOT_TOOL_PINNING_V1` is accepted too) turns on one bundle, default off: up to 10 pinned MCP tools stay in the tool list instead of moving behind `tool_search` (pins come from a `pinned-tools.json` manifest at `HERMES_PINNED_TOOLS_FILE`, or a JSON array in `HERMES_PINNED_TOOLS`; past 10,000 schema tokens the least-used pins are dropped); `tool_search` returns only an alphabetical `[{name, description}]` list of at most 20 tools; repeated `tool_describe` calls for the same tool reuse a cached payload; and `mcp_*` results spill at **15,000 chars** regardless of `tool_budget.mcp_result_size_chars`. With the flag on, `--usage-file` reports also carry `tool_search_calls`, `tool_describe_calls`, `tool_calls_total` and `pinned_schema_tokens`. Unsetting the flag restores every behaviour above.
+
 Hermes also flags **provider-side elision**: when an MCP or web tool result embeds its own truncation markers (`...N more items`, `"has_more": true`, "saved to sandbox" notes), a one-line notice is appended to the result warning that the visible data is incomplete and should be paged/fetched before treating any enumeration as complete.
 
 ## Global Toolset Disable

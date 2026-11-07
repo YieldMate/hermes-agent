@@ -17,12 +17,13 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from hermes_cli.config_defaults import DEFAULT_CONFIG
+from tools import hot_tool_pinning
 from tools.registry import tool_error
 from toolsets import CLIENT_SURFACE_TOOLSETS, TOOLSET_SESSION_PLATFORMS
 from tools.tool_search_catalog import (
     BRIDGE_TOOL_NAMES, CHARS_PER_TOKEN, TOOL_CALL_NAME, TOOL_DESCRIBE_NAME, TOOL_SEARCH_NAME,
     CatalogEntry, _fn, _listing_group_label, _registry_entry, _registry_toolset,
-    build_catalog, build_catalog_listing_with_form, search_catalog)
+    _short_desc, build_catalog, build_catalog_listing_with_form, search_catalog)
 from tools.tool_search_validation import (
     local_batch_error, normalize_tool_call_entries, not_deferrable_error, session_unavailable_error,
     unavailable_in_session_reason, validate_deferred_call_args)
@@ -152,6 +153,8 @@ def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None) 
     user override), OR an MCP tool, OR neither core nor a session-gated GUI surface (i.e. a
     plugin tool). Bridge names never defer."""
     if name in BRIDGE_TOOL_NAMES:
+        return False
+    if hot_tool_pinning.is_pinned_tool(name):
         return False
     if defer_tools is not None and name in defer_tools:
         return True
@@ -346,6 +349,7 @@ def assemble_tool_defs(tool_defs: list[dict[str, Any]], *, context_length: Optio
     """Tool-defs the model should see: passthrough when inactive, else deferrable tools
     replaced by the three bridge tools. Idempotent — existing bridge tools are stripped first."""
     config = config or load_config()
+    hot_tool_pinning.release_if_disabled()
     incoming = [td for td, name in zip(tool_defs, _tool_def_names(tool_defs))
                 if name not in BRIDGE_TOOL_NAMES]
     visible, deferrable = classify_tools(incoming, config.effective_defer_tools)
@@ -454,6 +458,11 @@ def dispatch_tool_search(args: dict[str, Any], *, current_tool_defs: list[dict[s
     if connections_in_scope(current_tool_defs):
         remote_entries, hosted_failure = connector_entries_by_group(
             queries, connector_search=connector_search, call=call)
+    if hot_tool_pinning.is_hot_tool_pinning_v1_enabled():
+        compact = _compact_search_records(queries, catalog, remote_entries)
+        _record_search_metric(current_tool_defs, catalog=catalog, hits=len(compact),
+                              outcome="connector_unavailable" if hosted_failure else "hits" if compact else "no_hits")
+        return json.dumps(compact, ensure_ascii=False)
     results: list[dict[str, Any]] = []
     tools_map: dict[str, dict[str, Any]] = {}
     available_sources = _available_source_summary(catalog)
@@ -480,6 +489,22 @@ def dispatch_tool_search(args: dict[str, Any], *, current_tool_defs: list[dict[s
     _record_search_metric(current_tool_defs, catalog=catalog, hits=len(tools_map),
                           outcome="connector_unavailable" if hosted_failure else "hits" if tools_map else "no_hits")
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _compact_search_records(queries: list[str], catalog: list[CatalogEntry],
+                            remote_entries: list[list[CatalogEntry]]) -> list[dict[str, str]]:
+    """Hot-pinning v1 search result: a bare ``[{name, description}]`` list, at most
+    ``SEARCH_RESULT_CAP`` tools, alphabetical. Corpora are name-sorted before ranking so BM25 ties
+    resolve by name and an identical query always yields identical bytes."""
+    by_name: dict[str, CatalogEntry] = {}
+    ranked: list[list[str]] = []
+    for position, query in enumerate(queries):
+        corpus = sorted(catalog + remote_entries[position], key=lambda entry: entry.name)
+        hits = search_catalog(corpus, query, limit=hot_tool_pinning.SEARCH_RESULT_CAP)
+        by_name.update((hit.name, hit) for hit in hits)
+        ranked.append([hit.name for hit in hits])
+    names = hot_tool_pinning.merge_ranked_names(ranked)
+    return [{"name": n, "description": _short_desc(by_name[n].description)} for n in names]
 
 
 def _record_search_metric(current_tool_defs: list[dict[str, Any]], *, hits: int, outcome: str,
@@ -511,12 +536,16 @@ def dispatch_tool_describe(args: dict[str, Any], *, current_tool_defs: list[dict
     undescribed: list[str] = []
     errors: dict[str, str] = {}
     session_names = session_tool_names(current_tool_defs)
+    hot = hot_tool_pinning.is_hot_tool_pinning_v1_enabled()
+    cached_payloads: dict[str, str] = {}
     for name in names:
         fn = by_name.get(name)
         remote_fn = remote_schemas.get(name)
         if fn is not None:
             tools[name] = {"description": fn.get("description", ""),
                            "parameters": fn.get("parameters", {})}
+            if hot:
+                cached_payloads[name] = _cached_describe_payload(name, tools[name])
         elif isinstance(remote_fn, dict):
             tools[name] = {"description": str(remote_fn.get("description", "")),
                            "parameters": remote_fn.get("parameters", {})}
@@ -539,7 +568,20 @@ def dispatch_tool_describe(args: dict[str, Any], *, current_tool_defs: list[dict
         result["errors"] = errors
     if hosted_failure:
         result["connectors"] = connectors_unavailable(hosted_failure, verb="described", names=undescribed)
+    if hot:
+        return hot_tool_pinning.render_describe_result(
+            tools, cached_payloads, {k: v for k, v in result.items() if k != "tools"})
     return json.dumps(result, ensure_ascii=False)
+
+
+def _cached_describe_payload(name: str, record: dict[str, Any]) -> str:
+    """Serialized describe record for a local tool, from the per-session cache when the registry
+    generation is unchanged (a hit never re-encodes the schema)."""
+    payload = hot_tool_pinning.get_describe_cache(name)
+    if payload is None:
+        payload = json.dumps(record, ensure_ascii=False)
+        hot_tool_pinning.set_describe_cache(name, payload)
+    return payload
 
 
 def scoped_deferrable_names(tool_defs: list[dict[str, Any]]) -> frozenset[str]:

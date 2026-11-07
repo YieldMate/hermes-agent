@@ -70,6 +70,47 @@ def _fold_moa_usage(agent, canonical_usage):
     return _moa_client, canonical_usage, _moa_ref_cost
 
 
+def _estimate_missing_provider_usage(agent: Any, messages: list[dict[str, Any]]) -> Any:
+    """Synthesize token counts when the provider (e.g. z-ai/glm-5.3) omits usage.
+
+    Uses the shared rough estimators so HERMES_USAGE_FILE / session counters stop
+    reporting zeros (YIE-67). Returns None only when the estimate is empty.
+    """
+    from agent.model_metadata import estimate_request_tokens_rough, estimate_tokens_rough
+    from agent.usage_pricing import CanonicalUsage
+
+    system_prompt = getattr(agent, "_cached_system_prompt", None) or ""
+    tools = getattr(agent, "_cached_tool_schemas", None) or getattr(agent, "tools", None)
+    try:
+        input_tokens = int(
+            estimate_request_tokens_rough(
+                messages or [],
+                system_prompt=system_prompt if isinstance(system_prompt, str) else "",
+                tools=tools if isinstance(tools, list) else None,
+            )
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("usage estimate (input) failed: %s", exc)
+        input_tokens = 0
+    output_text = (
+        getattr(agent, "_current_streamed_assistant_text", None)
+        or getattr(agent, "_last_assistant_text", None)
+        or ""
+    )
+    try:
+        output_tokens = int(estimate_tokens_rough(str(output_text))) if output_text else 0
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("usage estimate (output) failed: %s", exc)
+        output_tokens = 0
+    if input_tokens <= 0 and output_tokens <= 0:
+        return None
+    return CanonicalUsage(
+        input_tokens=max(0, input_tokens),
+        output_tokens=max(0, output_tokens),
+        raw_usage={"estimated": True, "method": "estimate_rough"},
+    )
+
+
 def record_response_usage(
     agent: Any, response: Any, *, messages: list[dict[str, Any]], api_call_count: int,
     api_duration: float, compression_attempts: int, max_compression_attempts: int,
@@ -92,10 +133,121 @@ def record_response_usage(
         _note_usage_less = getattr(compressor, "note_usage_less_response", None)
         if callable(_note_usage_less):
             _note_usage_less()
-        logger.info(
-            "API call #%d: model=%s provider=%s in=? out=? total=? latency=%.1fs usage=unavailable",
-            agent.session_api_calls, agent.model, agent.provider or "unknown", api_duration,
+        estimated = _estimate_missing_provider_usage(agent, messages)
+        if estimated is None:
+            logger.info(
+                "API call #%d: model=%s provider=%s in=? out=? total=? latency=%.1fs usage=unavailable",
+                agent.session_api_calls, agent.model, agent.provider or "unknown", api_duration,
+            )
+            agent._last_response_token_count = None
+            return ResponseUsageOutcome(compression_attempts=compression_attempts, rearmed=rearmed)
+        # Local estimate so receipts/usage files stop at 0 (YIE-67).
+        canonical_usage = estimated
+        aggregator_usage = canonical_usage
+        prompt_tokens = canonical_usage.prompt_tokens
+        completion_tokens = canonical_usage.output_tokens
+        total_tokens = canonical_usage.total_tokens
+        usage_dict = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "input_tokens": canonical_usage.input_tokens,
+            "output_tokens": canonical_usage.output_tokens,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+        }
+        compressor.update_from_response(usage_dict)
+        # Estimates are for receipts only — keep the usageless latch so preflight
+        # does not wait forever for provider usage glm-5.3 will never send.
+        if callable(_note_usage_less):
+            _note_usage_less()
+        agent._last_turn_usage = dict(usage_dict)
+        agent._last_prompt_size_tokens = int(prompt_tokens or 0)
+        # Per-message token_count is the assistant message's own tokens, not prompt+completion.
+        agent._last_response_token_count = int(completion_tokens or 0)
+        # Jump to session counter / cost folding below (skip provider normalize).
+        _wire_model = getattr(agent, "_paperclip_wire_model", None)
+        _log_model = (
+            _wire_model.strip()
+            if isinstance(_wire_model, str) and _wire_model.strip()
+            else agent.model
         )
+        logger.info(
+            "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs usage=estimated",
+            agent.session_api_calls, _log_model, agent.provider or "unknown",
+            prompt_tokens, completion_tokens, total_tokens, api_duration,
+        )
+        agent.session_prompt_tokens += prompt_tokens
+        agent.session_completion_tokens += completion_tokens
+        agent.session_total_tokens += total_tokens
+        agent.session_input_tokens += canonical_usage.input_tokens
+        agent.session_output_tokens += canonical_usage.output_tokens
+        _agg_cost_model = (
+            _wire_model.strip()
+            if isinstance(_wire_model, str) and _wire_model.strip()
+            else agent.model
+        )
+        cost_result = estimate_usage_cost(
+            _agg_cost_model, aggregator_usage, provider=agent.provider,
+            base_url=agent.base_url, api_key=getattr(agent, "api_key", ""),
+        )
+        # Force estimated status for local synthesis (keep amount when rate card priced it).
+        if getattr(cost_result, "status", None) != "included":
+            from dataclasses import replace as _dc_replace
+            cost_result = _dc_replace(cost_result, status="estimated", source="none")
+        _cost_delta = None
+        if cost_result.amount_usd is not None:
+            _cost_delta = float(cost_result.amount_usd)
+            agent.session_estimated_cost_usd += _cost_delta
+        agent.session_cost_status = "estimated"
+        agent.session_cost_source = "local_estimate"
+        if getattr(agent, "_paperclip_model_route_active", False):
+            _uby_model = _log_model
+            buckets = getattr(agent, "session_usage_by_model", None)
+            if not isinstance(buckets, dict):
+                buckets = {}
+                agent.session_usage_by_model = buckets
+            part = buckets.get(_uby_model)
+            if not isinstance(part, dict):
+                part = {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "estimated_cost_usd": 0.0,
+                }
+                buckets[_uby_model] = part
+            part["input_tokens"] += int(canonical_usage.input_tokens or 0)
+            part["output_tokens"] += int(canonical_usage.output_tokens or 0)
+            if _cost_delta is not None:
+                part["estimated_cost_usd"] = float(part.get("estimated_cost_usd") or 0.0) + float(_cost_delta)
+        if agent._session_db and agent.session_id:
+            try:
+                if not agent._session_db_created:
+                    agent._ensure_db_session()
+                agent._session_db.queue_token_counts(
+                    agent.session_id,
+                    source=_agent_session_source(agent),
+                    input_tokens=canonical_usage.input_tokens,
+                    output_tokens=canonical_usage.output_tokens,
+                    cache_read_tokens=0,
+                    cache_write_tokens=0,
+                    reasoning_tokens=0,
+                    estimated_cost_usd=_cost_delta,
+                    cost_status="estimated",
+                    cost_source="local_estimate",
+                    billing_provider=agent.provider,
+                    billing_base_url=agent.base_url,
+                    billing_mode=None,
+                    model=_log_model,
+                    api_call_count=1,
+                    task=getattr(agent, "_turn_route_task", "") or "",
+                )
+            except Exception as e:
+                logger.debug(
+                    "Token persistence failed (session=%s, tokens=%d): %s",
+                    agent.session_id, total_tokens, e,
+                )
         return ResponseUsageOutcome(compression_attempts=compression_attempts, rearmed=rearmed)
 
     canonical_usage = with_served_service_tier(
@@ -186,6 +338,8 @@ def record_response_usage(
     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+    # Per-message token_count is this assistant reply's completion tokens.
+    agent._last_response_token_count = int(canonical_usage.output_tokens or 0)
     # Rolling history for status-bar averages (last 10).
     with suppress(Exception):
         hist = getattr(agent, "_api_latency_history", None)

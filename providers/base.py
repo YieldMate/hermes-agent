@@ -24,6 +24,34 @@ logger = logging.getLogger(__name__)
 OMIT_TEMPERATURE = object()
 
 
+# Placeholder embedded in ``default_headers`` User-Agent values at plugin import.
+# Resolved on first use via :func:`resolve_default_headers` so provider plugins never
+# call ``get_version_info()`` (and its git tax) at import time (YIE-66).
+_HERMES_VERSION_TOKEN = "{hermes_version}"
+
+
+def versioned_user_agent(product: str) -> str:
+    """Build a User-Agent template resolved when headers are applied, not at import."""
+    return f"{product}/{_HERMES_VERSION_TOKEN}"
+
+
+def resolve_default_headers(headers: dict[str, str] | None) -> dict[str, str]:
+    """Copy ``headers``, substituting :data:`_HERMES_VERSION_TOKEN` via ``get_version_info``."""
+    if not headers:
+        return {}
+    if not any(isinstance(v, str) and _HERMES_VERSION_TOKEN in v for v in headers.values()):
+        return dict(headers)
+    try:
+        from hermes_cli.version_info import get_version_info  # lazy: avoid layer cycle at import time
+        version = get_version_info().base_version
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+        version = "unknown"
+    return {
+        k: (v.replace(_HERMES_VERSION_TOKEN, version) if isinstance(v, str) else v)
+        for k, v in headers.items()
+    }
+
+
 def _profile_user_agent() -> str:
     """Return a ``hermes-cli/<version>`` UA string, with a stable fallback.
 
@@ -135,6 +163,8 @@ class ProviderProfile:
     hostname: str = ""
 
     # ── Client-level quirks (set once at client construction) ─
+    # Values may embed ``{hermes_version}`` (see :func:`versioned_user_agent`); callers that
+    # send these on the wire must use :meth:`resolved_default_headers`.
     default_headers: dict[str, str] = field(default_factory=dict)
 
     # ── Request-level quirks ─────────────────────────────────
@@ -153,6 +183,10 @@ class ProviderProfile:
     model_capabilities: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     # ── Hooks (override in subclass for complex providers) ───
+
+    def resolved_default_headers(self) -> dict[str, str]:
+        """``default_headers`` with version placeholders filled (safe for HTTP clients)."""
+        return resolve_default_headers(self.default_headers)
 
     def fetch_account_usage(
         self, *, base_url: str | None = None, api_key: str | None = None
@@ -423,7 +457,7 @@ class ProviderProfile:
         # the default ``Python-urllib/<ver>`` User-Agent.  Set a generic
         # hermes-cli UA so the catalog endpoint is reachable.
         req.add_header("User-Agent", _profile_user_agent())
-        for k, v in self.default_headers.items():
+        for k, v in self.resolved_default_headers().items():
             req.add_header(k, v)
 
         try:

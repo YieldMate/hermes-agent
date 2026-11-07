@@ -300,3 +300,130 @@ def test_a_timed_out_status_probe_never_strands_index_lock(tmp_path):
     _git_version_info(tmp_path, include_untracked=True)
 
     assert not (tmp_path / ".git" / "index.lock").exists()
+
+
+def test_local_stamp_skips_rev_parse_guard_when_head_differs(tmp_path, monkeypatch):
+    """A source=local (or other non-git) stamp is accepted without comparing HEAD — the
+    re-stamp path for local branch installs (YIE-66)."""
+    stamp = {
+        "commit": "a" * 40,
+        "branch": "hermes-wake-speed",
+        "baseVersion": "unknown",
+        "displayVersion": "git.aaaaaaa",
+        "source": "local",
+        "updateMechanism": "self",
+        "payload": "bootstrap",
+    }
+    stamp_file = tmp_path / "install-stamp.json"
+    stamp_file.write_text(json.dumps(stamp), encoding="utf-8")
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr("hermes_cli.version_info._resolve_stamp_file", lambda: stamp_file)
+    monkeypatch.setattr(
+        "hermes_cli.version_info._run_git",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("git must not run for source=local")),
+    )
+    monkeypatch.setattr("hermes_cli.version_info._force_live_git", lambda: False)
+    monkeypatch.setattr("hermes_cli.version_info._read_disk_cache", lambda: None)
+    monkeypatch.setattr("hermes_cli.version_info._write_disk_cache", lambda info: None)
+
+    info = get_version_info()
+
+    assert info.commit == "a" * 40
+    assert info.source == "local"
+    assert info.branch == "hermes-wake-speed"
+
+
+def test_git_stamp_rejected_when_live_head_differs(tmp_path, monkeypatch):
+    stamp = {
+        "commit": "a" * 40,
+        "source": "git",
+        "updateMechanism": "self",
+        "payload": "bootstrap",
+    }
+    stamp_file = tmp_path / "install-stamp.json"
+    stamp_file.write_text(json.dumps(stamp), encoding="utf-8")
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr("hermes_cli.version_info._resolve_stamp_file", lambda: stamp_file)
+    monkeypatch.setattr("hermes_cli.version_info._run_git", lambda *a, **k: "b" * 40)
+    monkeypatch.setattr("hermes_cli.version_info._resolve_repo_dir", lambda: None)
+    monkeypatch.setattr("hermes_cli.version_info._force_live_git", lambda: False)
+    monkeypatch.setattr("hermes_cli.version_info._read_disk_cache", lambda: None)
+    monkeypatch.setattr("hermes_cli.version_info._write_disk_cache", lambda info: None)
+
+    info = get_version_info()
+
+    assert info.source == "unknown"
+    assert info.commit is None
+
+
+def test_disk_cache_used_only_when_stamp_absent(tmp_path, monkeypatch):
+    """Stamp always wins over disk; disk only memoizes git/unknown after a stamp miss."""
+    from hermes_cli import version_info as vi
+
+    monkeypatch.setattr(vi, "_disk_cache_path", lambda: tmp_path / "version_info.json")
+    monkeypatch.setattr(vi, "_force_live_git", lambda: False)
+    monkeypatch.setattr(vi, "_resolve_repo_dir", lambda: None)
+
+    # Seed disk with a git-shaped memo for commit B.
+    vi._write_disk_cache(VersionInfo("1.0.0", "1.0.0", 0, "b" * 40, "main", "git"))
+
+    stamp = {
+        "commit": "a" * 40,
+        "baseVersion": "2.0.0",
+        "displayVersion": "2.0.0",
+        "source": "local",
+        "updateMechanism": "self",
+        "payload": "bootstrap",
+    }
+    stamp_file = tmp_path / "install-stamp.json"
+    stamp_file.write_text(json.dumps(stamp), encoding="utf-8")
+    monkeypatch.setattr(vi, "_resolve_stamp_file", lambda: stamp_file)
+
+    stamped = get_version_info()
+    assert stamped.commit == "a" * 40
+    assert stamped.source == "local"
+
+    _reset_version_info_cache()
+    monkeypatch.setattr(vi, "_resolve_stamp_file", lambda: None)
+    # After reset, disk was cleared; with no stamp/git → unknown (not stale B).
+    assert get_version_info().source == "unknown"
+
+
+def test_git_resolution_is_memoized_on_disk(tmp_path, monkeypatch):
+    from hermes_cli import version_info as vi
+
+    monkeypatch.setattr(vi, "_disk_cache_path", lambda: tmp_path / "version_info.json")
+    monkeypatch.setattr(vi, "_force_live_git", lambda: False)
+    monkeypatch.setattr(vi, "_resolve_stamp_file", lambda: None)
+    monkeypatch.setattr(
+        vi, "_git_version_info",
+        lambda repo, **kw: VersionInfo("9.9.9", "9.9.9", 0, "d" * 40, "main", "git"),
+    )
+    monkeypatch.setattr(vi, "_resolve_repo_dir", lambda: tmp_path)
+
+    first = get_version_info()
+    assert first.commit == "d" * 40
+    # Process cache clear only — leave disk so the next call proves the memo.
+    vi._cached_version_info = None
+    monkeypatch.setattr(
+        vi, "_git_version_info",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("git must not run; disk should hit")),
+    )
+    second = get_version_info()
+    assert second == first
+
+
+def test_force_git_only_reads_version_mapping(tmp_path, monkeypatch):
+    from hermes_cli import version_info as vi
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "other:\n  force_git: true\nversion:\n  force_git: false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: home)
+    assert vi._force_live_git() is False
+
+    (home / "config.yaml").write_text("version:\n  force_git: true\n", encoding="utf-8")
+    assert vi._force_live_git() is True

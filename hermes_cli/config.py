@@ -3818,8 +3818,14 @@ _CONFIG_USAGE = """Available commands:
   hermes config env-path  Show .env file path"""
 
 
+# Deferred provider OPTIONAL_ENV_VARS injection (YIE-66) — sibling owns the body so this
+# facade never pays list_providers() at import. Re-exported for existing callers.
+from hermes_cli.config_provider_env import ensure_provider_profile_env_vars
+
+
 def config_command(args):
     """Handle config subcommands."""
+    ensure_provider_profile_env_vars()
     subcmd = getattr(args, 'config_command', None)
     handler = _CONFIG_SUBCOMMANDS.get(subcmd)
     if handler is not None:
@@ -3829,35 +3835,6 @@ def config_command(args):
     print()
     print(_CONFIG_USAGE)
     sys.exit(1)
-
-
-# ---- OPTIONAL_ENV_VARS injection from provider profiles and platform plugins (once, at import) ----
-
-def _inject_profile_env_vars() -> None:
-    """Expose env_vars of every ``auth_type="api_key"`` provider in providers/ via OPTIONAL_ENV_VARS
-    without editing this file."""
-    try:
-        from providers import list_providers
-        for _pp in list_providers():
-            if _pp.auth_type != "api_key":
-                continue
-            for _var in _pp.env_vars:
-                if _var in OPTIONAL_ENV_VARS:
-                    continue
-                _is_key = not _var.endswith(("_BASE_URL", "_URL"))
-                _label = _pp.display_name or _pp.name
-                OPTIONAL_ENV_VARS[_var] = {
-                    "description": f"{_label} {'API key' if _is_key else 'base URL override'}",
-                    "prompt": f"{_label} {'API key' if _is_key else 'base URL (leave empty for default)'}",
-                    "url": _pp.signup_url or None,
-                    "password": _is_key,
-                    "category": "provider",
-                    "advanced": True}
-    except Exception:
-        pass
-
-
-_inject_profile_env_vars()
 
 
 PlatformManifestSource = Literal["all", "bundled", "user"]
@@ -4030,8 +4007,8 @@ def _inject_platform_plugin_env_vars() -> frozenset[str] | None:
     for dir_name, manifest in manifests:
         label = manifest.get("label") or manifest.get("name") or dir_name
         for name, is_secret, meta in _platform_manifest_env_entries(manifest):
-            if name in OPTIONAL_ENV_VARS:
-                continue  # hardcoded entry wins (back-compat)
+            if name in OPTIONAL_ENV_VARS or name in CORE_DECLARED_ENV_NAMES:
+                continue  # hardcoded / provider-profile entry wins (back-compat)
             OPTIONAL_ENV_VARS[name] = {
                 "description": meta.get("description") or f"{label} configuration",
                 "prompt": meta.get("prompt") or name,
@@ -4044,5 +4021,8 @@ def _inject_platform_plugin_env_vars() -> frozenset[str] | None:
 # Names declared in core, before any platform manifest is read. A manifest never reclassifies
 # one: the config form keeps the core entry, and the child-env scrub keeps a plugin that lists
 # OPENAI_API_KEY from turning a provider key into an adapter secret.
-CORE_DECLARED_ENV_NAMES: frozenset[str] = frozenset(OPTIONAL_ENV_VARS)
+# Provider profile env names are harvested without writing OPTIONAL_ENV_VARS descriptions
+# (those stay deferred via ensure_provider_profile_env_vars) so CORE stays complete (YIE-66).
+from hermes_cli.config_provider_env import provider_api_key_env_names as _provider_api_key_env_names
+CORE_DECLARED_ENV_NAMES: frozenset[str] = frozenset(OPTIONAL_ENV_VARS) | _provider_api_key_env_names()
 BUNDLED_PLATFORM_SECRET_ENVS: frozenset[str] | None = _inject_platform_plugin_env_vars()

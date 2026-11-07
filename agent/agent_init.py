@@ -843,7 +843,7 @@ def _explicit_client_kwargs(agent, api_key, base_url, _provider_timeout) -> dict
             from providers import get_provider_profile as _gpf
             _ph = _gpf(agent.provider)
             if _ph and _ph.default_headers:
-                client_kwargs["default_headers"] = dict(_ph.default_headers)
+                client_kwargs["default_headers"] = _ph.resolved_default_headers()
     return client_kwargs
 
 

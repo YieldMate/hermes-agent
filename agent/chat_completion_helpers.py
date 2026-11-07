@@ -1647,6 +1647,10 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     msg = stamp_message_timestamp({"role": "assistant",
         "content": _assistant_content_for_storage(agent, assistant_message), "reasoning": reasoning_text,
         "finish_reason": finish_reason})
+    # Per-message token_count when the provider (or YIE-67 local estimate) supplied usage.
+    _token_count = getattr(agent, "_last_response_token_count", None)
+    if isinstance(_token_count, int) and _token_count > 0:
+        msg["token_count"] = _token_count
 
     raw_reasoning_content = getattr(assistant_message, "reasoning_content", None)
     if raw_reasoning_content is None:

@@ -50,8 +50,9 @@ class TestFireworksAliases:
 
 class TestFireworksConfigRegistry:
     def test_optional_env_vars_include_fireworks(self):
-        from hermes_cli.config import OPTIONAL_ENV_VARS
+        from hermes_cli.config import OPTIONAL_ENV_VARS, ensure_provider_profile_env_vars
 
+        ensure_provider_profile_env_vars()
         assert "FIREWORKS_API_KEY" in OPTIONAL_ENV_VARS
         assert OPTIONAL_ENV_VARS["FIREWORKS_API_KEY"]["category"] == "provider"
         assert OPTIONAL_ENV_VARS["FIREWORKS_API_KEY"]["password"] is True

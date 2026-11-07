@@ -142,24 +142,51 @@ def _build_preloaded_skills_prompt(skills: object = None) -> str | None:
     return skills_prompt or None
 
 
+def _mcp_toolset_aliases(server_name: str) -> set[str]:
+    """Accept both bare server keys and the ``mcp-<name>`` toolset form on ``-t``."""
+    name = str(server_name).strip()
+    if not name:
+        return set()
+    aliases = {name}
+    if name.startswith("mcp-"):
+        bare = name[4:]
+        if bare:
+            aliases.add(bare)
+    else:
+        aliases.add(f"mcp-{name}")
+    return aliases
+
+
 def _configured_mcp_servers() -> tuple[set[str], set[str]]:
-    """``(enabled, disabled)`` MCP server names from config; both empty on any error."""
+    """``(enabled, disabled)`` MCP server names from config + overlay.
+
+    Includes bare keys and ``mcp-<name>`` aliases so Paperclip's ``-t mcp-paperclip-*``
+    entries validate instead of being stripped before discovery. Config and overlay are
+    loaded independently so a config import failure cannot hide a live overlay.
+    """
+    enabled: set[str] = set()
+    disabled: set[str] = set()
     try:
         from hermes_cli.config import read_raw_config
         from tools.mcp_tool_common import mcp_server_enabled
 
         cfg = read_raw_config()
         mcp_servers = cfg.get("mcp_servers") if isinstance(cfg.get("mcp_servers"), dict) else {}
-        enabled: set[str] = set()
-        disabled: set[str] = set()
         for name, server_cfg in mcp_servers.items():
             if not isinstance(server_cfg, dict):
                 continue
             target = enabled if mcp_server_enabled(server_cfg) else disabled
-            target.add(str(name))
-        return enabled, disabled
+            target.update(_mcp_toolset_aliases(str(name)))
     except Exception:
-        return set(), set()
+        pass
+    try:
+        from tools.mcp_tool_config import _load_mcp_overlay
+
+        for name in _load_mcp_overlay():
+            enabled.update(_mcp_toolset_aliases(str(name)))
+    except Exception:
+        pass
+    return enabled, disabled
 
 
 def _validate_explicit_toolsets(toolsets: object = None) -> tuple[list[str] | None, str | None]:

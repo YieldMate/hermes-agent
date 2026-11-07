@@ -2259,7 +2259,7 @@ def _profile_default_headers(provider: str) -> Optional[dict]:
         from providers import get_provider_profile
         profile = get_provider_profile(provider)
         if profile and profile.default_headers:
-            return dict(profile.default_headers)
+            return profile.resolved_default_headers()
     return None
 
 
